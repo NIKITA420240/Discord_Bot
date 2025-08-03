@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  discord-bot:
+    build: .
+    container_name: discord-bot-v2
+    restart: unless-stopped
+    volumes:
+      # Монтируем файл .env для переменных окружения
+      - ./.env:/app/.env:ro
+      # Монтируем credentials.json для Google Sheets API
+      - ./credentials.json:/app/credentials.json:ro
+      # Монтируем файлы данных напрямую
+      - ./bot.log:/app/bot.log
+      - ./bot_database.db:/app/bot_database.db
+    environment:
+      - TZ=Europe/Moscow
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
+
+ 
