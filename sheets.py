@@ -61,11 +61,25 @@ def update_google_sheets(spreadsheet_id, curator_data, hour, day, month_name):
             row_idx = name_to_row[name]
             col_idx = hour + 2  # A=1, B=2 (час 0), C=3 (час 1)...
                 
+
             # Записываем значение
-            updates.append({
+            if count == 0:
+                updates.append({
+                    'range': gspread.utils.rowcol_to_a1(row_idx, col_idx),
+                    'values': [['o']]
+                })
+            elif count == -1:
+                updates.append({
+                    'range': gspread.utils.rowcol_to_a1(row_idx, col_idx),
+                    'values': [['c']]
+                })
+            else:
+                updates.append({
                 'range': gspread.utils.rowcol_to_a1(row_idx, col_idx),
                 'values': [[count]]
-            })
+                })
+
+            
 
             logging.info(f"Куратор {name} имеет {count} чатов, за время {day} {month_name}, {hour}:00")
         

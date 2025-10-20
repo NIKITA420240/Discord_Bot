@@ -77,7 +77,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT curator_name, chats_count 
                     FROM curator_messages 
-                    WHERE message_date = ? AND message_hour = ?
+                    WHERE message_date = ? AND message_hour = ? and (chats_count <= 40 and chats_count >= 0)
                     ORDER BY curator_name
                 ''', (message_date, message_hour))
                 
@@ -97,7 +97,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT message_date, message_hour, chats_count, created_at
                     FROM curator_messages 
-                    WHERE curator_name = ? 
+                    WHERE curator_name = ? and (chats_count <= 40 and chats_count >= 0)
                     AND message_date >= date('now', '-{} days')
                     ORDER BY message_date DESC, message_hour DESC
                 '''.format(days), (curator_name,))
@@ -117,7 +117,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT curator_name, SUM(chats_count) as total_chats
                     FROM curator_messages 
-                    WHERE message_date = ?
+                    WHERE message_date = ? and (chats_count <= 40 and chats_count >= 0)
                     GROUP BY curator_name
                     ORDER BY total_chats DESC
                 ''', (date,))
@@ -140,6 +140,7 @@ class DatabaseManager:
                     FROM curator_messages 
                     WHERE strftime('%Y', message_date) = ? 
                     AND strftime('%m', message_date) = ?
+                    AND (chats_count <= 40 and chats_count >= 0)
                     GROUP BY curator_name
                     ORDER BY total_chats DESC
                 ''', (str(year), f"{month:02d}"))
@@ -151,8 +152,8 @@ class DatabaseManager:
             logging.error(f"Ошибка при получении месячной статистики: {e}")
             return {}
     
-    def get_top_curators(self, days: int = 7, limit: int = 10) -> List[Tuple]:
-        """Получение топ кураторов за период"""
+    def get_top_curators_count_sms(self, days: int = 7, limit: int = 10) -> List[Tuple]:
+        """Получение топ кураторов по количеству детей за период"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -160,9 +161,30 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT curator_name, SUM(chats_count) as total_chats
                     FROM curator_messages 
-                    WHERE message_date >= date('now', '-{} days')
+                    WHERE message_date >= date('now', '-{} days') and (chats_count <= 40 and chats_count >= 0)
                     GROUP BY curator_name
                     ORDER BY total_chats DESC
+                    LIMIT ?
+                '''.format(days), (limit,))
+                
+                return cursor.fetchall()
+                
+        except Exception as e:
+            logging.error(f"Ошибка при получении топ кураторов: {e}")
+            return []
+
+    def get_top_curators_count_hours(self, days: int = 7, limit: int = 10) -> List[Tuple]:
+        """Получение топ кураторов по количеству рабочих часов"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT curator_name, count(chats_count) as total_hours
+                    FROM curator_messages 
+                    WHERE message_date >= date('now', '-{} days') and (chats_count <= 40 and chats_count >= 0)
+                    GROUP BY curator_name
+                    ORDER BY total_hours DESC
                     LIMIT ?
                 '''.format(days), (limit,))
                 
@@ -191,6 +213,29 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка при удалении старых записей: {e}")
             return 0
+    
+    def get_last_k_messages(self, k: int = 10) -> List[Tuple]:
+        """Получение последних k сообщений из базы данных (отсортированных по времени добавления)"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT curator_name, discord_id, message_date, message_hour, 
+                           chats_count, created_at
+                    FROM curator_messages 
+                    Where (chats_count <= 40 and chats_count >= 0)
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                ''', (k,))
+                
+                results = cursor.fetchall()
+                logging.info(f"Получено {len(results)} последних сообщений")
+                return results
+                
+        except Exception as e:
+            logging.error(f"Ошибка при получении последних {k} сообщений: {e}")
+            return []
     
     def get_database_stats(self) -> Dict:
         """Получение статистики базы данных"""
@@ -224,3 +269,26 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка при получении статистики БД: {e}")
             return {} 
+
+
+    def get_avg_chats_for_hour(self) -> List[Tuple[int, float]]:
+        """Получение среднего количества чатов по часам"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT message_hour, AVG(chats_count) as avg_chats
+                    FROM curator_messages 
+                    Where (chats_count <= 40 and chats_count >= 0)
+                    GROUP BY message_hour
+                    ORDER BY message_hour
+                ''')
+                
+                results = cursor.fetchall()
+                logging.info(f"Получено {len(results)} записей статистики по часам")
+                return results
+                
+        except Exception as e:
+            logging.error(f"Ошибка при получении статистики по часам: {e}")
+            return [] 

@@ -24,6 +24,9 @@ class DataCollector:
         hour = msg_time.hour
         message_date = msg_time.strftime('%Y-%m-%d')
 
+        # Учёт серого куратора
+        if message.content == "c" or message.content == "с" or message.content == "С" or message.content == "C":
+            return -1, day, month_name, hour, message_date
         numbers = re.findall(r'\d+', message.content.strip())
         if numbers:
             total = sum(map(int, numbers))
@@ -68,6 +71,8 @@ class DataCollector:
                 seen_users.add(author_tag)
                 
                 # Сохраняем в БД
+
+                
                 self.db_manager.add_curator_message(
                     Default_curator, 
                     author_tag, 
