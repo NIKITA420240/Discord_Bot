@@ -176,17 +176,21 @@ class DatabaseManager:
     def get_top_curators_count_hours(self, days: int = 7, limit: int = 10) -> List[Tuple]:
         """Получение топ кураторов по количеству рабочих часов"""
         try:
+            cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
                 cursor.execute('''
-                    SELECT curator_name, count(chats_count) as total_hours
-                    FROM curator_messages 
-                    WHERE message_date >= date('now', '-{} days') and (chats_count <= 40 and chats_count >= 0)
+                    SELECT curator_name, COUNT(*) AS total_hours
+                    FROM curator_messages
+                    WHERE message_date >= ?
+                    AND chats_count BETWEEN 0 AND 40
                     GROUP BY curator_name
                     ORDER BY total_hours DESC
                     LIMIT ?
-                '''.format(days), (limit,))
+                    ''',
+                    (cutoff, limit),
+                )
                 
                 return cursor.fetchall()
                 

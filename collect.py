@@ -134,6 +134,10 @@ class DataCollector:
         """Получает дневную статистику из БД"""
         return self.db_manager.get_daily_stats(date)
 
-    def get_top_curators(self, days: int = 7, limit: int = 10):
-        """Получает топ кураторов из БД"""
-        return self.db_manager.get_top_curators(days, limit) 
+    def get_top_curators_count_hours(self, days: int = 7, limit: int = 10):
+        """Получает топ кураторов по часам из БД"""
+        return self.db_manager.get_top_curators_count_hours(days, limit) 
+
+    def get_top_curators_count_sms(self, days: int = 7, limit: int = 10):
+        """Получает топ кураторов по количеству детей из БД"""
+        return self.db_manager.get_top_curators_count_sms(days, limit) 
