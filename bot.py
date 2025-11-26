@@ -1,6 +1,7 @@
 from operator import truediv
 import os
 import asyncio
+from functools import partial
 import logging
 from dotenv import load_dotenv
 import discord
@@ -74,22 +75,28 @@ logging.info("Discord бот инициализирован")
 logging.info("База данных подключена")
 
 async def update_sheet():
-    """Обновляет Google Sheets и базу данных"""
+    """Обновляет Google Sheets и базу данных (Асинхронно)"""
     guild = bot.get_guild(GUILD_ID)
-    channel = guild.get_channel(CHANNEL_ID)
-
     if not guild:
         logging.error("Сервер не найден!")
-        return {}
+        return {}, 0, 0, "", False
+        
+    channel = guild.get_channel(CHANNEL_ID)
     if not channel:
         logging.error("Канал не найден")
-        return {}
+        return {}, 0, 0, "", False
 
+    # Сбор данных (это асинхронно, всё ок)
     curator_data, hour, day, month_name, _ = await data_collector.collect_discord_data(channel)
     
-    # Обновляем Google Sheets (опционально)
+    # Обновляем Google Sheets (В ОТДЕЛЬНОМ ПОТОКЕ)
     if curator_data:
-        success = update_google_sheets(SPREADSHEET_ID, curator_data, hour, day, month_name)
+        loop = asyncio.get_running_loop()
+        # Вот этот вызов спасет бота от зависания:
+        success = await loop.run_in_executor(
+            None, 
+            partial(update_google_sheets, SPREADSHEET_ID, curator_data, hour, day, month_name)
+        )
         return curator_data, hour, day, month_name, success
     else:
         logging.info("Нет данных для обновления")
@@ -406,21 +413,31 @@ async def on_ready():
     print(f"Бот {bot.user} запущен!")
     logging.info(f"Бот {bot.user} запущен!")
     logging.info("База данных подключена и готова к работе")
-    print("Бот готов к работе!")
 
-    # Периодическое обновление
+    # --- УМНАЯ ПРОВЕРКА ЗАПУСКА ---
+    # Получаем сохраненную задачу (если есть)
+    existing_task = getattr(bot, 'periodic_task_object', None)
+
+    # Проверяем:
+    # 1. Задача вообще существует?
+    # 2. Если существует, она всё ещё выполняется? (not .done())
+    if existing_task and not existing_task.done():
+        logging.info("Цикл уже активно работает, повторный запуск не требуется.")
+        return
+    
+    # Если мы здесь — значит, задачи нет или она умерла. Запускаем новую.
+    logging.info("Запускаем (или перезапускаем) фоновую задачу...")
+
     async def periodic_task():
         await bot.wait_until_ready()
         channel = bot.get_guild(GUILD_ID).get_channel(CHANNEL_ID)
-
-        # здесь будем хранить, за какой час уже отправили сообщение
         last_sent = None  
 
         while not bot.is_closed():
             try:
                 now = datetime.now()
 
-                # проверяем, что минута совпала и за этот час ещё не отправляли
+                # --- 1. ОТПРАВКА СООБЩЕНИЯ (55 МИНУТ) ---
                 if (
                     now.minute == Time_to_send
                     and (await last_message_check_is_not_chats(channel))
@@ -428,23 +445,32 @@ async def on_ready():
                 ):
                     await channel.send(f"Пишите количество чатов за {now.hour} час. НЕ ПИШИТЕ в {Time_to_send} МИНУТ!!! Дождитесь хотя-бы минуты.")
                     logging.info(f"Отправляем сообщение за {now.hour} час")
-
-                    # запоминаем, что за этот час сообщение уже отправлено
                     last_sent = (now.date(), now.hour)
+                    await asyncio.sleep(65)
+                    continue 
 
-                    # спим до смены минуты, чтобы не сработать повторно
-                    await asyncio.sleep(61)
-
+                # --- 2. ОБНОВЛЕНИЕ ТАБЛИЦ ---
                 else:
-                    # обычное обновление
-                    await update_sheet()
+                    await update_sheet() # Теперь тут стоит run_in_executor внутри, всё безопасно
                     logging.info("Периодическое обновление...")
-                    await asyncio.sleep(20)
+                    
+                    # --- 3. УМНЫЙ СОН ---
+                    now_after_work = datetime.now()
+                    seconds_to_sleep = 60 - now_after_work.second
+                    await asyncio.sleep(seconds_to_sleep + 0.5)
 
+            except asyncio.CancelledError:
+                # Если задачу специально отменили - выходим корректно
+                logging.info("Фоновая задача была отменена.")
+                break
             except Exception as e:
-                logging.error(f"Ошибка в periodic_task: {e}", exc_info=True)   
+                # Если любая другая ошибка - ловим и продолжаем работать
+                logging.error(f"Ошибка в periodic_task: {e}", exc_info=True)
+                await asyncio.sleep(60)
 
-    bot.loop.create_task(periodic_task())
+    # СОХРАНЯЕМ ОБЪЕКТ ЗАДАЧИ В БОТА
+    # Теперь мы не просто True ставим, а сохраняем ссылку на живой процесс
+    bot.periodic_task_object = bot.loop.create_task(periodic_task())
 
 
 if __name__ == "__main__":
