@@ -14,6 +14,7 @@ def update_google_sheets(spreadsheet_id, curator_data, hour, day, month_name):
             return True
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
         client = gspread.authorize(creds)
+        client.set_timeout(60)  # Тайм-аут 60 секунд
         
         # Название листа: "18 июня"
         today_sheet_name = f"{day} {month_name}"
