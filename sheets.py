@@ -172,36 +172,34 @@ def _update_weekly_schedule(client, spreadsheet_id, curator_data, hour, dt_now):
 def update_both_tables(spreadsheet_id_stats, spreadsheet_id_schedule, curator_data, hour, day_str, month_str, dt_now, update_schedule=False):
     """
     Авторизуется и обновляет таблицы.
-    update_schedule=True -> обновляет и статистику, и расписание (имена).
-    update_schedule=False -> обновляет ТОЛЬКО статистику (цифры).
+    Возвращает список конфликтов (имен), если они есть.
     """
-    conflicts_found = []
+    conflicts_found = [] # Инициализируем пустой список сразу
+    
     try:
         if not curator_data:
-            return True
+            return [] 
 
-        # Авторизация один раз
+        # Авторизация
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
         client = gspread.authorize(creds)
         client.set_timeout(60)
 
-        # 1. Первая таблица (Статистика / Цифры) — ОБНОВЛЯЕМ ВСЕГДА
-        res1 = _update_daily_stats(client, spreadsheet_id_stats, curator_data, hour, day_str, month_str)
+        # 1. Обновляем статистику (всегда)
+        _update_daily_stats(client, spreadsheet_id_stats, curator_data, hour, day_str, month_str)
         
-        # 2. Вторая таблица (Расписание / Имена) — ТОЛЬКО ЕСЛИ РАЗРЕШЕНО (ФЛАГ TRUE)
+        # 2. Обновляем расписание (только если нужно)
         if update_schedule:
             conflicts_found = _update_weekly_schedule(client, spreadsheet_id_schedule, curator_data, hour, dt_now)
-            logging.info("--> Обновление РАСПИСАНИЯ выполнено (по расписанию или вручную).")
+            logging.info("--> Обновление РАСПИСАНИЯ выполнено.")
         else:
-            # Если флаг False, мы просто пропускаем этот шаг, чтобы не спамить в историю версий
-            logging.info("--> Обновление расписания пропущено (экономим историю версий).")
+            logging.info("--> Обновление расписания пропущено.")
 
-        return res1 and res2 
+        return conflicts_found 
         
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"Критическая ошибка обновления таблиц: {e}")
         return []
-
 
 def get_scheduled_workers(client, spreadsheet_id, dt_now, hour):
     """

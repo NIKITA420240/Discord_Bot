@@ -9,19 +9,14 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
-from utils import (
-    CHECK_MINUTES, 
-    LOG_CHANNEL_ID, 
-    SCOPES, 
-    CREDENTIALS_FILE
-)
+from utils import CHECK_MINUTES, LOG_CHANNEL_ID, SCOPES, CREDENTIALS_FILE
 from users import get_tag_by_name # Импортируем функцию для тегов
 import sys
 import matplotlib.pyplot as plt
 
 from collect import DataCollector
 from database import DatabaseManager
-from sheets import update_both_tables, get_scheduled_workers, get_senior_for_hour # Импортируем новую функцию
+from sheets import update_both_tables, get_scheduled_workers, get_senior_for_hour
 
 # Логирование
 class MoscowFormatter(logging.Formatter):
@@ -509,7 +504,7 @@ async def on_ready():
                     # 1. Собираем данные через ваш коллектор
                     # Предполагаем, что collector инициализирован в main или глобально
                     # Если collector внутри main, лучше прицепить его к боту: bot.collector = collector
-                    curator_data = await bot.loop.run_in_executor(None, collector.collect_data)
+                    curator_data = await bot.loop.run_in_executor(None, bot.collector.collect_data)
                     
                     # Сохраняем в память бота для проверки через 5 минут
                     bot.last_collected_data = curator_data
