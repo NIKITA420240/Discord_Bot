@@ -77,7 +77,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT curator_name, chats_count 
                     FROM curator_messages 
-                    WHERE message_date = ? AND message_hour = ? and (chats_count <= 40 and chats_count >= 0)
+                    WHERE message_date = ? AND message_hour = ? and (chats_count <= 40 and chats_count >= -1)
                     ORDER BY curator_name
                 ''', (message_date, message_hour))
                 
@@ -97,7 +97,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT message_date, message_hour, chats_count, created_at
                     FROM curator_messages 
-                    WHERE curator_name = ? and (chats_count <= 40 and chats_count >= 0)
+                    WHERE curator_name = ? and (chats_count <= 40 and chats_count >= -1)
                     AND message_date >= date('now', '-{} days')
                     ORDER BY message_date DESC, message_hour DESC
                 '''.format(days), (curator_name,))
@@ -117,7 +117,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT curator_name, SUM(chats_count) as total_chats
                     FROM curator_messages 
-                    WHERE message_date = ? and (chats_count <= 40 and chats_count >= 0)
+                    WHERE message_date = ? and (chats_count <= 40 and chats_count >= -1)
                     GROUP BY curator_name
                     ORDER BY total_chats DESC
                 ''', (date,))
@@ -140,7 +140,7 @@ class DatabaseManager:
                     FROM curator_messages 
                     WHERE strftime('%Y', message_date) = ? 
                     AND strftime('%m', message_date) = ?
-                    AND (chats_count <= 40 and chats_count >= 0)
+                    AND (chats_count <= 40 and chats_count >= -1)
                     GROUP BY curator_name
                     ORDER BY total_chats DESC
                 ''', (str(year), f"{month:02d}"))
@@ -184,7 +184,7 @@ class DatabaseManager:
                     SELECT curator_name, COUNT(*) AS total_hours
                     FROM curator_messages
                     WHERE message_date >= ?
-                    AND chats_count BETWEEN 0 AND 40
+                    AND chats_count BETWEEN -1 AND 40
                     GROUP BY curator_name
                     ORDER BY total_hours DESC
                     LIMIT ?
@@ -228,7 +228,7 @@ class DatabaseManager:
                     SELECT curator_name, discord_id, message_date, message_hour, 
                            chats_count, created_at
                     FROM curator_messages 
-                    Where (chats_count <= 40 and chats_count >= 0)
+                    Where (chats_count <= 40 and chats_count >= -1)
                     ORDER BY created_at DESC
                     LIMIT ?
                 ''', (k,))
@@ -284,7 +284,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT message_hour, AVG(chats_count) as avg_chats
                     FROM curator_messages 
-                    Where (chats_count <= 40 and chats_count >= 0)
+                    Where (chats_count <= 40 and chats_count >= -1)
                     GROUP BY message_hour
                     ORDER BY message_hour
                 ''')

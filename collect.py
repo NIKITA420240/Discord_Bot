@@ -24,14 +24,16 @@ class DataCollector:
         hour = msg_time.hour
         message_date = msg_time.strftime('%Y-%m-%d')
 
-        # Учёт серого куратора
+        # !!! ИЗМЕНЕНИЕ: Возвращаем msg_time (объект datetime) шестым аргументом
         if message.content == "c" or message.content == "с" or message.content == "С" or message.content == "C":
-            return -1, day, month_name, hour, message_date
+            return -1, day, month_name, hour, message_date, msg_time
+            
         numbers = re.findall(r'\d+', message.content.strip())
         if numbers:
             total = sum(map(int, numbers))
-            return total, day, month_name, hour, message_date
-        return 0, day, month_name, hour, message_date
+            return total, day, month_name, hour, message_date, msg_time
+            
+        return 0, day, month_name, hour, message_date, msg_time
 
     async def collect_discord_data(self, channel):
         """Собирает сообщения пользователей за последний час с сохранением в БД"""
@@ -41,6 +43,9 @@ class DataCollector:
         seen_users = set()
 
         day = month_name = hour = message_date = None
+        
+        # !!! ИЗМЕНЕНИЕ: Переменная для хранения объекта времени
+        dt_object = datetime.now() 
 
         async for message in channel.history(limit=1000):
             if message.author.bot:
@@ -66,13 +71,16 @@ class DataCollector:
                 self.black_users.add(name)
 
                 # Если неизвестный куратор - Егор Гаязов
-                total, day, month_name, hour, message_date = self.get_curator_chats(message)
+                # !!! ИЗМЕНЕНИЕ: Распаковываем 6 значений
+                total, day, month_name, hour, message_date, msg_time = self.get_curator_chats(message)
+                
                 curator_data[Default_curator] = total
                 seen_users.add(author_tag)
                 
-                # Сохраняем в БД
-
+                # Обновляем dt_object актуальным временем сообщения
+                dt_object = msg_time 
                 
+                # Сохраняем в БД (здесь используем строку message_date)
                 self.db_manager.add_curator_message(
                     Default_curator, 
                     author_tag, 
@@ -89,9 +97,12 @@ class DataCollector:
                 logging.info(f"Пользователь {author_tag} не является куратором")
 
                 # Если неизвестный куратор - Егор Гаязов
-                total, day, month_name, hour, message_date = self.get_curator_chats(message)
+                # !!! ИЗМЕНЕНИЕ: Распаковываем 6 значений
+                total, day, month_name, hour, message_date, msg_time = self.get_curator_chats(message)
+                
                 curator_data[Default_curator] = total
                 seen_users.add(author_tag)
+                dt_object = msg_time 
                 
                 # Сохраняем в БД
                 self.db_manager.add_curator_message(
@@ -105,9 +116,11 @@ class DataCollector:
                 logging.info(f"Считали Дефолтного куратора - {Default_curator} [{day} {month_name}] [{hour}:00]: {total} чатов")
                 continue
             
-            total, day, month_name, hour, message_date = self.get_curator_chats(message)
+            # !!! ИЗМЕНЕНИЕ: Распаковываем 6 значений
+            total, day, month_name, hour, message_date, msg_time = self.get_curator_chats(message)
             curator_data[name] = total
             seen_users.add(author_tag)
+            dt_object = msg_time 
             
             # Сохраняем в БД
             self.db_manager.add_curator_message(
@@ -120,7 +133,9 @@ class DataCollector:
             
             logging.info(f"Считали - {name} [{day} {month_name}] [{hour}:00]: {total} чатов")
             
-        return curator_data, hour, day, month_name, message_date
+        # !!! ИЗМЕНЕНИЕ: Возвращаем dt_object последним элементом вместо строки message_date
+        # dt_object - это datetime, который нужен для sheets.py
+        return curator_data, hour, day, month_name, dt_object
 
     def get_stats_from_db(self, message_date: str, message_hour: int):
         """Получает статистику из базы данных"""
@@ -140,4 +155,4 @@ class DataCollector:
 
     def get_top_curators_count_sms(self, days: int = 7, limit: int = 10):
         """Получает топ кураторов по количеству детей из БД"""
-        return self.db_manager.get_top_curators_count_sms(days, limit) 
+        return self.db_manager.get_top_curators_count_sms(days, limit)

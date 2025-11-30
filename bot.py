@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 from collect import DataCollector
 from database import DatabaseManager
-from sheets import update_google_sheets
+from sheets import update_both_tables
 
 # Логирование
 class MoscowFormatter(logging.Formatter):
@@ -56,6 +56,7 @@ def get_env_var(name, required=True) -> str:
 
 TOKEN = get_env_var("DISCORD_TOKEN")
 SPREADSHEET_ID = get_env_var("SPREADSHEET_ID")
+SPREADSHEET_ID_SCHEDULE = get_env_var("SPREADSHEET_ID_SCHEDULE")
 GUILD_ID = int(get_env_var("GUILD_ID"))
 CHANNEL_ID = int(get_env_var("CHANNEL_ID"))
 
@@ -74,8 +75,12 @@ last_sent = None
 logging.info("Discord бот инициализирован")
 logging.info("База данных подключена")
 
-async def update_sheet():
-    """Обновляет Google Sheets и базу данных (Асинхронно)"""
+async def update_sheet(force_schedule_update=False):
+    """
+    Обновляет Google Sheets и базу данных (Асинхронно).
+    force_schedule_update: Если True, то принудительно обновит таблицу "Рабочие часы" (имена).
+                           Если False, обновит только статистику (цифры), чтобы не мусорить в истории.
+    """
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         logging.error("Сервер не найден!")
@@ -86,16 +91,33 @@ async def update_sheet():
         logging.error("Канал не найден")
         return {}, 0, 0, "", False
 
-    # Сбор данных (это асинхронно, всё ок)
-    curator_data, hour, day, month_name, _ = await data_collector.collect_discord_data(channel)
+    # Сбор данных
+    result = await data_collector.collect_discord_data(channel)
     
+    # Распаковка результатов (5 элементов)
+    curator_data = result[0]
+    hour = result[1]
+    day = result[2]
+    month_name = result[3]
+    dt_obj = result[4] # Объект даты для правильного поиска недели
+
     # Обновляем Google Sheets (В ОТДЕЛЬНОМ ПОТОКЕ)
     if curator_data:
         loop = asyncio.get_running_loop()
-        # Вот этот вызов спасет бота от зависания:
+        
         success = await loop.run_in_executor(
             None, 
-            partial(update_google_sheets, SPREADSHEET_ID, curator_data, hour, day, month_name)
+            partial(
+                update_both_tables, 
+                SPREADSHEET_ID,          # ID таблицы статистики
+                SPREADSHEET_ID_SCHEDULE, # ID таблицы расписания (имен)
+                curator_data, 
+                hour, 
+                day, 
+                month_name, 
+                dt_obj,
+                force_schedule_update    # <-- Передаем флаг: нужно ли обновлять имена сейчас?
+            )
         )
         return curator_data, hour, day, month_name, success
     else:
@@ -133,13 +155,18 @@ async def last_message_check_is_not_chats(channel):
     else:
         return True
 
+
 # Команда "!обнови"
 @bot.command(name="обнови")
+@commands.has_any_role("Старший куратор", "Admin", "Administrator")
 async def обнови(ctx):
-    await ctx.send("Собираю данные и обновляю таблицу...")
-    curator_data, hour, day, month_name, success = await update_sheet()
+    await ctx.send("🔄 Собираю данные и принудительно обновляю ОБЕ таблицы (Статистику и Расписание)...")
+    
+    # force_schedule_update=True -> Запишет и цифры, и имена кураторов
+    curator_data, hour, day, month_name, success = await update_sheet(force_schedule_update=True)
+    
     status = "успешно" if success else "с ошибками"
-    await ctx.send(f"Готово! Статус: {status}. Обработано: {len(curator_data)} записей за {day} {month_name}, {hour}:00 часов.")
+    await ctx.send(f"✅ Готово! Статус: {status}. Обработано: {len(curator_data)} записей за {day} {month_name}, {hour}:00 часов.")
 
 # Команда "!покажи"
 @bot.command(name="покажи")
@@ -250,6 +277,7 @@ async def история(ctx, *curator_name: str, days: int = 7):
 
 # Команда "!очистить"
 @bot.command(name="очистить")
+@commands.has_any_role("старший куратор", "Admin", "Administrator")
 async def очистить(ctx, days: int = 90):
     """Удаляет старые записи из базы данных"""
     try:
@@ -409,6 +437,26 @@ async def get_plot_avg_chats(ctx):
         await ctx.send(f"❌ Произошла ошибка при создании графика: {str(e)}")
 
 @bot.event
+async def on_command_error(ctx, error):
+    # Если ошибка связана с отсутствием роли
+    if isinstance(error, commands.MissingRole):
+        await ctx.send(f"⛔ {ctx.author.mention}, у вас нет прав для этой команды. Нужна роль **старший куратор**.")
+    
+    # Если ошибка связана с отсутствием любой из ролей (если используете has_any_role)
+    elif isinstance(error, commands.MissingAnyRole):
+        await ctx.send(f"⛔ {ctx.author.mention}, у вас нет прав. Нужна роль **старший куратор**.")
+        
+    # Если команда не найдена (опционально, можно убрать)
+    elif isinstance(error, commands.CommandNotFound):
+        pass # Игнорируем, если пишут бред
+        
+    else:
+        # Остальные ошибки логируем
+        logging.error(f"Ошибка команды: {error}")
+        # Можно раскомментировать для отладки:
+        # await ctx.send(f"Произошла ошибка: {error}")
+
+@bot.event
 async def on_ready():
     print(f"Бот {bot.user} запущен!")
     logging.info(f"Бот {bot.user} запущен!")
@@ -428,44 +476,73 @@ async def on_ready():
     # Если мы здесь — значит, задачи нет или она умерла. Запускаем новую.
     logging.info("Запускаем (или перезапускаем) фоновую задачу...")
 
+    # !!! ВНИМАНИЕ: Здесь исправлен отступ (ровно 4 пробела) !!!
     async def periodic_task():
         await bot.wait_until_ready()
         channel = bot.get_guild(GUILD_ID).get_channel(CHANNEL_ID)
-        last_sent = None  
+        
+        # Переменные-"защелки", чтобы помнить, что мы уже сделали в текущем часу
+        last_sent_msg = None          # Когда отправляли сообщение "Пишите чаты"
+        last_schedule_update = None   # Когда обновляли таблицу имен (расписание)
 
         while not bot.is_closed():
             try:
-                now = datetime.now()
+                # Берем текущее время
+                now = datetime.now() 
+                current_hour_key = (now.date(), now.hour) # Уникальный ключ текущего часа (Дата, Час)
 
-                # --- 1. ОТПРАВКА СООБЩЕНИЯ (55 МИНУТ) ---
+                # ==========================================
+                # 1. ОТПРАВКА СООБЩЕНИЯ "ПИШИТЕ" (в 55 минут)
+                # ==========================================
                 if (
-                    now.minute == Time_to_send
-                    and (await last_message_check_is_not_chats(channel))
-                    and last_sent != (now.date(), now.hour)
+                    now.minute == Time_to_send # 55
+                    and last_sent_msg != current_hour_key # Еще не отправляли в этом часу
                 ):
-                    await channel.send(f"Пишите количество чатов за {now.hour} час. НЕ ПИШИТЕ в {Time_to_send} МИНУТ!!! Дождитесь хотя-бы минуты.")
-                    logging.info(f"Отправляем сообщение за {now.hour} час")
-                    last_sent = (now.date(), now.hour)
-                    await asyncio.sleep(65)
-                    continue 
+                    # Проверяем, не пишет ли уже кто-то (чтобы не перебивать)
+                    if await last_message_check_is_not_chats(channel):
+                        await channel.send(f"Пишите количество чатов за {now.hour} час. НЕ ПИШИТЕ в {Time_to_send} МИНУТ!!!")
+                        logging.info(f"🔔 Отправлен призыв писать отчеты за {now.hour} час")
+                        last_sent_msg = current_hour_key # Ставим галочку: "В этом часу отправили"
+                        
+                        # Небольшая пауза, чтобы не спамить, и идем на следующий круг
+                        await asyncio.sleep(5) 
+                        continue 
 
-                # --- 2. ОБНОВЛЕНИЕ ТАБЛИЦ ---
-                else:
-                    await update_sheet() # Теперь тут стоит run_in_executor внутри, всё безопасно
-                    logging.info("Периодическое обновление...")
-                    
-                    # --- 3. УМНЫЙ СОН ---
-                    now_after_work = datetime.now()
-                    seconds_to_sleep = 60 - now_after_work.second
-                    await asyncio.sleep(seconds_to_sleep + 0.5)
+                # ==========================================
+                # 2. ОБНОВЛЕНИЕ ТАБЛИЦ (Каждую минуту)
+                # ==========================================
+                force_schedule = False
 
-            except asyncio.CancelledError:
-                # Если задачу специально отменили - выходим корректно
-                logging.info("Фоновая задача была отменена.")
-                break
+                # ЛОГИКА ОБНОВЛЕНИЯ РАСПИСАНИЯ (ИМЕН) В 50 МИНУТ
+                # Если на часах 50 минут И мы еще не обновляли расписание в этом часу
+                if now.minute == 50 and last_schedule_update != current_hour_key:
+                    force_schedule = True
+                    last_schedule_update = current_hour_key # Ставим галочку: "В этом часу расписание обновили"
+                    logging.info("⚡ Время :50 минут -> Фиксируем список работающих (Рабочие Часы).")
+                
+                # Запускаем обновление
+                await update_sheet(force_schedule_update=force_schedule)
+                
+
+                # ==========================================
+                # 3. УМНЫЙ СОН (Выравнивание по минутам)
+                # ==========================================
+                # Это гарантирует, что бот проснется ровно в :00 секунд следующей минуты
+                now_after_work = datetime.now()
+                
+                # Сколько секунд осталось до конца минуты?
+                seconds_to_sleep = 60 - now_after_work.second
+                
+                # Если задача работала долго и мы уже в :59 секундах, спим минимум 1 секунду
+                if seconds_to_sleep < 0: 
+                    seconds_to_sleep = 1
+                
+                logging.info(f"Сплю {seconds_to_sleep:.1f} сек до следующей минуты...")
+                await asyncio.sleep(seconds_to_sleep + 0.1) # +0.1 для гарантии перехода
+
             except Exception as e:
-                # Если любая другая ошибка - ловим и продолжаем работать
                 logging.error(f"Ошибка в periodic_task: {e}", exc_info=True)
+                # Если ошибка, спим фиксировано минуту, чтобы не долбить сервер в цикле
                 await asyncio.sleep(60)
 
     # СОХРАНЯЕМ ОБЪЕКТ ЗАДАЧИ В БОТА
