@@ -613,7 +613,7 @@ async def on_ready():
                 # Логируем долгий сон только если не выполняли работу (чтобы не спамить)
                 if now.minute != 0 and now.minute != CHECK_MINUTES:
                 # Можно уменьшить частоту логов, если мешает
-                pass
+                    pass
                 
                 await asyncio.sleep(seconds_to_sleep + 0.5) # +0.5 для гарантии перехода на новую минуту
 
