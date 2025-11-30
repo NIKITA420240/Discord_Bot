@@ -1,3 +1,5 @@
+from google.oauth2.service_account import Credentials
+import gspread
 from operator import truediv
 import os
 import asyncio
@@ -7,13 +9,19 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
-from utils import Time_to_send
+from utils import (
+    CHECK_MINUTES, 
+    LOG_CHANNEL_ID, 
+    SCOPES, 
+    CREDENTIALS_FILE
+)
+from users import get_tag_by_name # Импортируем функцию для тегов
 import sys
 import matplotlib.pyplot as plt
 
 from collect import DataCollector
 from database import DatabaseManager
-from sheets import update_both_tables
+from sheets import update_both_tables, get_scheduled_workers, get_senior_for_hour # Импортируем новую функцию
 
 # Логирование
 class MoscowFormatter(logging.Formatter):
@@ -59,14 +67,11 @@ SPREADSHEET_ID = get_env_var("SPREADSHEET_ID")
 SPREADSHEET_ID_SCHEDULE = get_env_var("SPREADSHEET_ID_SCHEDULE")
 GUILD_ID = int(get_env_var("GUILD_ID"))
 CHANNEL_ID = int(get_env_var("CHANNEL_ID"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", 0)) # Загружаем ID канала из .env
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Инициализация базы данных
-db_manager = DatabaseManager()
-data_collector = DataCollector(db_manager)
 
 # Переменная для хранения времени последнего отправления
 last_sent = None
@@ -478,72 +483,148 @@ async def on_ready():
 
     # !!! ВНИМАНИЕ: Здесь исправлен отступ (ровно 4 пробела) !!!
     async def periodic_task():
+        """
+        Основной цикл задач бота:
+        1. В XX:00 — Собирает статистику и обновляет таблицы.
+        2. В XX:05 — Проверяет, совпадает ли расписание с реальностью.
+        """
         await bot.wait_until_ready()
-        channel = bot.get_guild(GUILD_ID).get_channel(CHANNEL_ID)
         
-        # Переменные-"защелки", чтобы помнить, что мы уже сделали в текущем часу
-        last_sent_msg = None          # Когда отправляли сообщение "Пишите чаты"
-        last_schedule_update = None   # Когда обновляли таблицу имен (расписание)
+        # Инициализация хранилища данных последнего часа (если его нет)
+        if not hasattr(bot, 'last_collected_data'):
+            bot.last_collected_data = {}
 
         while not bot.is_closed():
             try:
-                # Берем текущее время
-                now = datetime.now() 
-                current_hour_key = (now.date(), now.hour) # Уникальный ключ текущего часа (Дата, Час)
+                now = datetime.now()
+                # Если у вас сервер в UTC, а нужна Москва, раскомментируйте:
+                # now = datetime.now(timezone.utc) + timedelta(hours=3)
 
                 # ==========================================
-                # 1. ОТПРАВКА СООБЩЕНИЯ "ПИШИТЕ" (в 55 минут)
+                # ЛОГИКА 1: ЗАПИСЬ ДАННЫХ (XX:00)
                 # ==========================================
-                if (
-                    now.minute == Time_to_send # 55
-                    and last_sent_msg != current_hour_key # Еще не отправляли в этом часу
-                ):
-                    # Проверяем, не пишет ли уже кто-то (чтобы не перебивать)
-                    if await last_message_check_is_not_chats(channel):
-                        await channel.send(f"Пишите количество чатов за {now.hour} час. НЕ ПИШИТЕ в {Time_to_send} МИНУТ!!!")
-                        logging.info(f"🔔 Отправлен призыв писать отчеты за {now.hour} час")
-                        last_sent_msg = current_hour_key # Ставим галочку: "В этом часу отправили"
-                        
-                        # Небольшая пауза, чтобы не спамить, и идем на следующий круг
-                        await asyncio.sleep(5) 
-                        continue 
+                if now.minute == 0:
+                    logging.info(f"Запуск ежечасного сбора данных ({now.strftime('%H:%M')})...")
+                    
+                    # 1. Собираем данные через ваш коллектор
+                    # Предполагаем, что collector инициализирован в main или глобально
+                    # Если collector внутри main, лучше прицепить его к боту: bot.collector = collector
+                    curator_data = await bot.loop.run_in_executor(None, collector.collect_data)
+                    
+                    # Сохраняем в память бота для проверки через 5 минут
+                    bot.last_collected_data = curator_data
+                    
+                    # 2. Обновляем таблицы
+                    # update_schedule=True -> пытаемся записать имена в расписание
+                    conflicts = await bot.loop.run_in_executor(None, lambda: update_both_tables(
+                        SPREADSHEET_ID_STATS, 
+                        SPREADSHEET_ID_SCHEDULE, 
+                        curator_data, 
+                        now.hour, 
+                        now.strftime("%d"), 
+                        MONTHS_GENITIVE[now.month], 
+                        now, 
+                        update_schedule=True
+                    ))
+
+                    # 3. Если при записи возникли конфликты (кто-то был записан, но не работал)
+                    if conflicts and LOG_CHANNEL_ID:
+                        try:
+                            # Авторизация для получения имени старшего
+                            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+                            client = gspread.authorize(creds)
+                            
+                            # Узнаем, кто старший на текущий час
+                            senior_name = get_senior_for_hour(client, SPREADSHEET_ID_SCHEDULE, now, now.hour)
+                            senior_tag = get_tag_by_name(senior_name) if senior_name else "Старший куратор"
+                            
+                            channel = bot.get_channel(LOG_CHANNEL_ID)
+                            if channel:
+                                conflicts_str = ", ".join(conflicts)
+                                await channel.send(
+                                    f"✏️ **Конфликт записи ({now.hour}:00)**\n"
+                                    f"{senior_tag}, внимание!\n"
+                                    f"В слотах уже были записаны люди, не сдавшие отчет: `{conflicts_str}`\n"
+                                    f"*(Я их не удалял, а работающих дописал в пустые места)*."
+                                )
+                        except Exception as e:
+                            logging.error(f"Ошибка при отправке алерта о конфликте записи: {e}")
 
                 # ==========================================
-                # 2. ОБНОВЛЕНИЕ ТАБЛИЦ (Каждую минуту)
+                # ЛОГИКА 2: ПРОВЕРКА ПРОГУЛЬЩИКОВ (XX:05)
                 # ==========================================
-                force_schedule = False
+                elif now.minute == CHECK_MINUTES:
+                    # Проверяем прошлый час. Если сейчас 15:05, проверяем смену 14:00-15:00
+                    check_hour = now.hour - 1
+                    check_dt = now
+                    
+                    # Обработка перехода через полночь (00:05 проверяет 23:00 вчера)
+                    if check_hour < 0:
+                        check_hour = 23
+                        check_dt = now - timedelta(days=1)
 
-                # ЛОГИКА ОБНОВЛЕНИЯ РАСПИСАНИЯ (ИМЕН) В 50 МИНУТ
-                # Если на часах 50 минут И мы еще не обновляли расписание в этом часу
-                if now.minute == 50 and last_schedule_update != current_hour_key:
-                    force_schedule = True
-                    last_schedule_update = current_hour_key # Ставим галочку: "В этом часу расписание обновили"
-                    logging.info("⚡ Время :50 минут -> Фиксируем список работающих (Рабочие Часы).")
-                
-                # Запускаем обновление
-                await update_sheet(force_schedule_update=force_schedule)
-                
+                    # Проверяем только если у нас ЕСТЬ данные за прошлый час
+                    if bot.last_collected_data:
+                        logging.info(f"Проверка расписания за {check_hour}:00...")
+                        try:
+                            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+                            client = gspread.authorize(creds)
+
+                            # 1. Кто должен был работать (из таблицы)
+                            scheduled_names = get_scheduled_workers(client, SPREADSHEET_ID_SCHEDULE, check_dt, check_hour)
+                            
+                            # 2. Кто реально работал (из памяти бота)
+                            # keys() возвращает имена кураторов, которые сдали отчет
+                            worked_names = list(bot.last_collected_data.keys())
+
+                            # 3. Старший на смене
+                            senior_name = get_senior_for_hour(client, SPREADSHEET_ID_SCHEDULE, check_dt, check_hour)
+                            senior_tag = get_tag_by_name(senior_name) if senior_name else "Неизвестный старший"
+
+                            # 4. Поиск прогульщиков
+                            absent_curators = []
+                            for name in scheduled_names:
+                                if name not in worked_names:
+                                    absent_curators.append(name)
+                            
+                            # 5. Отправка отчета
+                            if absent_curators and LOG_CHANNEL_ID:
+                                channel = bot.get_channel(LOG_CHANNEL_ID)
+                                if channel:
+                                    # Превращаем имена прогульщиков в теги
+                                    absent_tags = [get_tag_by_name(name) for name in absent_curators]
+                                    absent_str = ", ".join(absent_tags)
+                                    
+                                    await channel.send(
+                                        f"⚠️ **Несовпадение расписания ({check_hour}:00 - {check_hour+1}:00)**\n"
+                                        f"Старший на смене: {senior_tag}\n\n"
+                                        f"Стояли в графике, но не сдали отчет:\n{absent_str}"
+                                    )
+                        except Exception as e:
+                            logging.error(f"Ошибка в блоке проверки расписания: {e}", exc_info=True)
+                    else:
+                        logging.warning("Пропуск проверки расписания: нет данных last_collected_data.")
 
                 # ==========================================
                 # 3. УМНЫЙ СОН (Выравнивание по минутам)
                 # ==========================================
-                # Это гарантирует, что бот проснется ровно в :00 секунд следующей минуты
+                # Гарантирует, что бот проснется ровно в :00 секунд следующей минуты
                 now_after_work = datetime.now()
-                
-                # Сколько секунд осталось до конца минуты?
                 seconds_to_sleep = 60 - now_after_work.second
                 
-                # Если задача работала долго и мы уже в :59 секундах, спим минимум 1 секунду
                 if seconds_to_sleep < 0: 
                     seconds_to_sleep = 1
                 
-                logging.info(f"Сплю {seconds_to_sleep:.1f} сек до следующей минуты...")
-                await asyncio.sleep(seconds_to_sleep + 0.1) # +0.1 для гарантии перехода
+                # Логируем долгий сон только если не выполняли работу (чтобы не спамить)
+                if now.minute != 0 and now.minute != CHECK_MINUTES:
+                # Можно уменьшить частоту логов, если мешает
+                pass
+                
+                await asyncio.sleep(seconds_to_sleep + 0.5) # +0.5 для гарантии перехода на новую минуту
 
             except Exception as e:
-                logging.error(f"Ошибка в periodic_task: {e}", exc_info=True)
-                # Если ошибка, спим фиксировано минуту, чтобы не долбить сервер в цикле
-                await asyncio.sleep(60)
+                logging.error(f"Критическая ошибка в periodic_task: {e}", exc_info=True)
+                await asyncio.sleep(60) # Спим минуту при ошибке, чтобы не дудосить сервер
 
     # СОХРАНЯЕМ ОБЪЕКТ ЗАДАЧИ В БОТА
     # Теперь мы не просто True ставим, а сохраняем ссылку на живой процесс
@@ -555,4 +636,8 @@ if __name__ == "__main__":
     logging.info(f"Токен: {TOKEN[:10]}...")
     logging.info(f"Guild ID: {GUILD_ID}")
     logging.info(f"Channel ID: {CHANNEL_ID}")
+    db_manager = DatabaseManager("bot_database.db")
+    collector = DataCollector(db_manager)
+    
+    bot.collector = collector
     bot.run(TOKEN)

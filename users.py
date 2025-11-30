@@ -81,3 +81,11 @@ user_map = {
     "tortchik": "Картышов Владимир",
     "wessy5353": "Стешин Алексей"
 }
+
+
+def get_tag_by_name(name):
+    """Возвращает меншен <@ID> или просто имя, если ID нет."""
+    user_id = NAME_TO_ID.get(name.strip())
+    if user_id:
+        return f"<@{user_id}>"
+    return name

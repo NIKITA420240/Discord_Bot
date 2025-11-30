@@ -2,6 +2,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import logging
 from datetime import datetime, timedelta
+from gspread.utils import rowcol_to_a1
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 CREDENTIALS_FILE = 'credentials.json'
@@ -70,24 +71,24 @@ def _update_daily_stats(client, spreadsheet_id, curator_data, hour, day_str, mon
         logging.error(f"Ошибка в _update_daily_stats: {e}")
         return False
 
-# --- ЛОГИКА 2: НОВАЯ (Вертикальная структура + Сохранение выпадающих списков) ---
 def _update_weekly_schedule(client, spreadsheet_id, curator_data, hour, dt_now):
+    """
+    Умное обновление расписания:
+    1. Читает текущие записи в слотах.
+    2. Если слот занят:
+       - Если имя совпадает с тем, кто сдал отчет -> ок.
+       - Если имя чужое -> добавляет в список конфликтов (для тега старшего).
+    3. Дописывает тех, кто сдал отчет, но кого нет в таблице, в пустые слоты.
+    
+    Returns:
+        list: Список имен (конфликтов), которые были в таблице, но не сдали отчет.
+    """
+    conflicts = [] # Список "чужаков" в расписании
+    
     try:
-        # 1. Подготовка даты (защита от строк)
-        if isinstance(dt_now, str):
-            try:
-                dt_now = datetime.strptime(dt_now, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                try:
-                    dt_now = datetime.fromisoformat(dt_now.replace('Z', '+00:00'))
-                except ValueError:
-                    logging.warning(f"Не удалось прочитать дату '{dt_now}', использую текущее время.")
-                    dt_now = datetime.now()
-
-        # Берем только тех, кто работал
-        active_curators = [name for name, count in curator_data.items()]
+        # 1. Подготовка (как раньше)
+        active_curators = [name for name, count in curator_data.items()] # Те, кто сдал отчет (работал)
         
-        # 2. Открытие листа
         sheet_name = get_weekly_sheet_name(dt_now) 
         spreadsheet = client.open_by_key(spreadsheet_id)
         
@@ -95,48 +96,76 @@ def _update_weekly_schedule(client, spreadsheet_id, curator_data, hour, dt_now):
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
             logging.warning(f"Таблица 2: Лист '{sheet_name}' не найден.")
-            return False
+            return []
 
-        # 3. Поиск дня недели (Вертикальный поиск)
+        # 2. Поиск строки и диапазона
         day_name = DAYS_RU[dt_now.weekday()] 
+        cell_day = worksheet.find(day_name)
         
-        try:
-            # Ищем ячейку с названием дня (например, "пятница")
-            cell_day = worksheet.find(day_name)
-        except gspread.CellNotFound:
-            logging.error(f"Таблица 2: Не найден заголовок дня '{day_name}' в таблице.")
-            return False
+        row_idx = cell_day.row + 1 + hour
+        col_start = 2 # Столбец B
+        MAX_SLOTS = 10 # Сколько ячеек отведено под имена
+        
+        # Получаем диапазон ячеек (например B10:K10)
+        range_start = rowcol_to_a1(row_idx, col_start)
+        range_end = rowcol_to_a1(row_idx, col_start + MAX_SLOTS - 1)
+        cell_range = f"{range_start}:{range_end}"
+        
+        # 3. ЧИТАЕМ текущие значения (важно!)
+        # get возвращает список списков [['Имя1', 'Имя2', '', ...]]
+        existing_values = worksheet.get(cell_range)
+        
+        # Превращаем в плоский список и дополняем пустыми строками до MAX_SLOTS, если список короче
+        current_row = existing_values[0] if existing_values else []
+        while len(current_row) < MAX_SLOTS:
+            current_row.append("")
 
-        day_start_row = cell_day.row
-        
-        # 4. Вычисление строки
-        # Формула: Строка заголовка дня + 1 + час
-        row_idx = day_start_row + 1 + hour
-        col_idx = 2 # Столбец B
+        new_row = current_row[:] # Копия для редактирования
 
-        # 5. Подготовка данных
-        MAX_SLOTS = 10
-        values = active_curators[:MAX_SLOTS]
-        # Заполняем пустотой, чтобы стереть старые данные
-        while len(values) < MAX_SLOTS: 
-            values.append("") 
+        # 4. Анализ занятых слотов
+        # Проходимся по тем, кто УЖЕ записан в таблице
+        for idx, name_in_sheet in enumerate(current_row):
+            name_in_sheet = name_in_sheet.strip()
+            
+            if name_in_sheet: # Если слот не пустой
+                if name_in_sheet in active_curators:
+                    # Куратор есть в таблице И сдал отчет.
+                    # Убираем его из списка active_curators, так как он "обработан"
+                    active_curators.remove(name_in_sheet)
+                else:
+                    # В таблице записан кто-то, кто НЕ сдал отчет (или это ошибка)
+                    # Мы его НЕ стираем (как просили), но запоминаем конфликт
+                    conflicts.append(name_in_sheet)
+        
+        # 5. Дозапись (Append)
+        # Оставшиеся в active_curators — это те, кто сдал отчет, но их нет в таблице.
+        # Ищем для них пустые места.
+        for worker in active_curators:
+            written = False
+            for idx, cell_val in enumerate(new_row):
+                if cell_val == "": # Нашли пустое место
+                    new_row[idx] = worker
+                    written = True
+                    break
+            
+            if not written:
+                logging.warning(f"Не хватило места (MAX_SLOTS) для записи {worker}")
 
-        # 6. Запись (USER_ENTERED сохраняет выпадающие списки)
-        range_start = gspread.utils.rowcol_to_a1(row_idx, col_idx)
-        range_end = gspread.utils.rowcol_to_a1(row_idx, col_idx + MAX_SLOTS - 1)
-        range_name = f"{range_start}:{range_end}"
+        # 6. Запись обновленной строки обратно
+        # Сравниваем, изменилось ли что-то, чтобы зря не дёргать API
+        if new_row != current_row:
+            worksheet.update(
+                range_name=cell_range, 
+                values=[new_row], 
+                value_input_option='USER_ENTERED'
+            )
+            logging.info(f"Таблица 2: Обновлено расписание на {hour}:00. Дописаны недостающие.")
         
-        worksheet.update(
-            range_name=range_name, 
-            values=[values], 
-            value_input_option='USER_ENTERED'
-        )
-        
-        logging.info(f"Таблица 2: Записано {len(active_curators)} имен в '{day_name}' {hour}:00 (строка {row_idx}).")
-        return True
+        return conflicts
+
     except Exception as e:
         logging.error(f"Ошибка в _update_weekly_schedule: {e}", exc_info=True)
-        return False
+        return []
 
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ---
@@ -146,6 +175,7 @@ def update_both_tables(spreadsheet_id_stats, spreadsheet_id_schedule, curator_da
     update_schedule=True -> обновляет и статистику, и расписание (имена).
     update_schedule=False -> обновляет ТОЛЬКО статистику (цифры).
     """
+    conflicts_found = []
     try:
         if not curator_data:
             return True
@@ -158,10 +188,9 @@ def update_both_tables(spreadsheet_id_stats, spreadsheet_id_schedule, curator_da
         # 1. Первая таблица (Статистика / Цифры) — ОБНОВЛЯЕМ ВСЕГДА
         res1 = _update_daily_stats(client, spreadsheet_id_stats, curator_data, hour, day_str, month_str)
         
-        res2 = True
         # 2. Вторая таблица (Расписание / Имена) — ТОЛЬКО ЕСЛИ РАЗРЕШЕНО (ФЛАГ TRUE)
         if update_schedule:
-            res2 = _update_weekly_schedule(client, spreadsheet_id_schedule, curator_data, hour, dt_now)
+            conflicts_found = _update_weekly_schedule(client, spreadsheet_id_schedule, curator_data, hour, dt_now)
             logging.info("--> Обновление РАСПИСАНИЯ выполнено (по расписанию или вручную).")
         else:
             # Если флаг False, мы просто пропускаем этот шаг, чтобы не спамить в историю версий
@@ -170,5 +199,67 @@ def update_both_tables(spreadsheet_id_stats, spreadsheet_id_schedule, curator_da
         return res1 and res2 
         
     except Exception as e:
-        logging.error(f"Критическая ошибка обновления таблиц: {e}")
-        return False
+        logging.error(f"Error: {e}")
+        return []
+
+
+def get_scheduled_workers(client, spreadsheet_id, dt_now, hour):
+    """
+    Возвращает список имен, записанных в расписании на конкретный час.
+    Нужно для проверки прогульщиков (Feature 1).
+    """
+    try:
+        sheet_name = get_weekly_sheet_name(dt_now)
+        spreadsheet = client.open_by_key(spreadsheet_id)
+        worksheet = spreadsheet.worksheet(sheet_name)
+        
+        day_name = DAYS_RU[dt_now.weekday()]
+        cell_day = worksheet.find(day_name)
+        
+        target_row = cell_day.row + 1 + hour
+        # Читаем строку (пропуская колонку А)
+        row_values = worksheet.row_values(target_row)
+        
+        if len(row_values) < 2:
+            return []
+            
+        # Очищаем от пустых строк и пробелов
+        scheduled_names = [n.strip() for n in row_values[1:] if n.strip()]
+        return scheduled_names
+    except Exception as e:
+        logging.error(f"Ошибка чтения расписания: {e}")
+        return []
+
+
+def get_senior_for_hour(client, spreadsheet_id, dt_now, hour):
+    """
+    Возвращает имя старшего куратора (из колонки C) на заданный час.
+    """
+    try:
+        sheet_name = get_weekly_sheet_name(dt_now)
+        spreadsheet = client.open_by_key(spreadsheet_id)
+        
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            return None
+
+        day_name = DAYS_RU[dt_now.weekday()]
+        
+        # Находим день
+        try:
+            cell_day = worksheet.find(day_name)
+        except gspread.CellNotFound:
+            return None
+            
+        # Вычисляем строку (День + 1 строка заголовка + час)
+        target_row = cell_day.row + 1 + hour
+        
+        # Колонка C (STARший) — это 3-я колонка
+        senior_name = worksheet.cell(target_row, 3).value
+        
+        return senior_name.strip() if senior_name else None
+
+    except Exception as e:
+        logging.error(f"Ошибка получения старшего куратора: {e}")
+        return None

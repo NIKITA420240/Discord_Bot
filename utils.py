@@ -1,5 +1,7 @@
 #Константы
 Time_to_send = 55
+# Время проверки (минуты)
+CHECK_MINUTES = 5
 Default_curator = "Гаязов Егор"
 # Список месяцев в родительном падеже
 months_name = [
