@@ -10,7 +10,7 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
 from utils import Time_to_send, CHECK_MINUTES, SCOPES, CREDENTIALS_FILE
-from users import get_tag_by_name # Импортируем функцию для тегов
+from users import get_login_by_name # Импортируем функцию для тегов
 import sys
 import matplotlib.pyplot as plt
 
@@ -59,6 +59,7 @@ def get_env_var(name, required=True) -> str:
 
 TOKEN = get_env_var("DISCORD_TOKEN")
 SPREADSHEET_ID = get_env_var("SPREADSHEET_ID")
+SPREADSHEET_ID_WORK_HOURS = get_env_var("SPREADSHEET_ID_WORK_HOURS")
 SPREADSHEET_ID_SCHEDULE = get_env_var("SPREADSHEET_ID_SCHEDULE")
 GUILD_ID = int(get_env_var("GUILD_ID"))
 CHANNEL_ID = int(get_env_var("CHANNEL_ID"))
@@ -75,6 +76,12 @@ last_sent = None
 logging.info("Discord бот инициализирован")
 logging.info("База данных подключена")
 
+# --- НОВАЯ ФУНКЦИЯ: Нормализация имен (Артём -> артем) ---
+def normalize_name(name):
+    if not name: return ""
+    return name.lower().replace('ё', 'е').strip()
+# ---------------------------------------------------------
+
 async def update_sheet(force_schedule_update=False):
     """
     Обновляет Google Sheets и базу данных (Асинхронно).
@@ -84,12 +91,12 @@ async def update_sheet(force_schedule_update=False):
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         logging.error("Сервер не найден!")
-        return {}, 0, 0, "", False
+        return {}, 0, 0, "", False, [] # +пустой список конфликтов
         
     channel = guild.get_channel(CHANNEL_ID)
     if not channel:
         logging.error("Канал не найден")
-        return {}, 0, 0, "", False
+        return {}, 0, 0, "", False, []
 
     # Сбор данных
     result = await bot.collector.collect_discord_data(channel)
@@ -105,12 +112,13 @@ async def update_sheet(force_schedule_update=False):
     if curator_data:
         loop = asyncio.get_running_loop()
         
-        success = await loop.run_in_executor(
+        # Получаем (success, conflicts)
+        update_result = await loop.run_in_executor(
             None, 
             partial(
                 update_both_tables, 
                 SPREADSHEET_ID,          # ID таблицы статистики
-                SPREADSHEET_ID_SCHEDULE, # ID таблицы расписания (имен)
+                SPREADSHEET_ID_WORK_HOURS, # ID таблицы расписания (имен)
                 curator_data, 
                 hour, 
                 day, 
@@ -119,10 +127,12 @@ async def update_sheet(force_schedule_update=False):
                 force_schedule_update    # <-- Передаем флаг: нужно ли обновлять имена сейчас?
             )
         )
-        return curator_data, hour, day, month_name, success
+        # Распаковываем
+        is_success, conflicts = update_result
+        return curator_data, hour, day, month_name, is_success, conflicts
     else:
         logging.info("Нет данных для обновления")
-        return {}, hour, day, month_name, True
+        return {}, hour, day, month_name, True, []
 
 async def read_channel_message(channel):
     """Читает одно сообщение из канала и проверяет, является ли оно сообщением бота"""
@@ -162,19 +172,36 @@ async def last_message_check_is_not_chats(channel):
 async def обнови(ctx):
     await ctx.send("🔄 Собираю данные и принудительно обновляю ОБЕ таблицы (Статистику и Расписание)...")
     
-    # force_schedule_update=True -> Запишет и цифры, и имена кураторов
-    curator_data, hour, day, month_name, success = await update_sheet(force_schedule_update=True)
+    # Распаковываем 6 значений
+    data, hour, day, month_name, success, conflicts = await update_sheet(force_schedule_update=True)
     
-    status = "успешно" if success else "с ошибками"
-    await ctx.send(f"✅ Готово! Статус: {status}. Обработано: {len(curator_data)} записей за {day} {month_name}, {hour}:00 часов.")
+    status = "успешно" if success else "с ошибками (см. логи)"
+    
+    # --- ВАЖНОЕ ДОБАВЛЕНИЕ: Обновляем метку времени и КЭШ ДАННЫХ ---
+    if success:
+        bot.last_collection_hour = hour
+        bot.last_collected_data = data  # <--- Теперь !тест_прогул увидит эти данные!
+        logging.info(f"Ручное обновление выполнено. Метка времени установлена на {hour}:00")
+    # --------------------------------------------------
+
+    msg = f"✅ Готово! Статус: {status}.\nОбработано: {len(data)} записей за {day} {month_name}, {hour}:00."
+    
+    if conflicts:
+        msg += f"\n\n⚠️ **Найдены конфликты в расписании:**\n{', '.join(conflicts)}"
+    
+    await ctx.send(msg)
 
 # Команда "!покажи"
 @bot.command(name="покажи")
 async def покажи(ctx):
     try:
-        curator_data, hour, day, month_name, message_date = await bot.collector.collect_discord_data(
+        result = await bot.collector.collect_discord_data(
             bot.get_guild(GUILD_ID).get_channel(CHANNEL_ID)
         )
+        curator_data = result[0]
+        hour = result[1]
+        day = result[2]
+        month_name = result[3]
         
         if not curator_data:
             await ctx.send("Нет данных за последний час.")
@@ -456,11 +483,162 @@ async def on_command_error(ctx, error):
         # Можно раскомментировать для отладки:
         # await ctx.send(f"Произошла ошибка: {error}")
 
+
+@bot.command(name="тест_прогул")
+@commands.has_any_role("Старший куратор", "Admin", "Administrator")
+async def тест_прогул(ctx):
+    """Тест: Принудительно запускает алгоритм поиска прогульщиков (как в :05 минут)"""
+    
+    # Проверяем, есть ли данные в памяти
+    if not hasattr(bot, 'last_collected_data') or not bot.last_collected_data:
+        await ctx.send("⚠️ **Нет данных о собранных чатах.**\nСначала выполните команду `!обнови` или дождитесь автоматического сбора, чтобы было с чем сравнивать.")
+        return
+
+    now = datetime.now(timezone.utc) + timedelta(hours=3) # Фикс времени для сервера
+    check_hour = now.hour
+    
+    await ctx.send(f"⚖️ **Сравниваю:** График на {check_hour}:00")
+
+    try:
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+        client = gspread.authorize(creds)
+
+        # 1. Кто должен быть (План)
+        scheduled = await bot.loop.run_in_executor(
+            None, get_scheduled_workers, client, SPREADSHEET_ID_SCHEDULE, now, check_hour
+        )
+        
+        # 2. Кто реально сдал отчеты (Факт)
+        worked = list(bot.last_collected_data.keys())
+
+        # --- НОРМАЛИЗАЦИЯ ИМЕН (ё->е) ---
+        worked_normalized = [normalize_name(n) for n in worked]
+        
+        absent = []
+        for name in scheduled:
+            if normalize_name(name) not in worked_normalized:
+                absent.append(name)
+        # --------------------------------
+
+        # 4. Вывод
+        msg = f"📋 **По расписанию ({len(scheduled)}):** {', '.join(scheduled)}\n"
+        msg += f"✅ **Кто прислал количество чатов ({len(worked)}):** {', '.join(worked)}\n"
+        msg += "---------------------------------\n"
+        
+        if absent:
+            mentions = [get_mention(name) for name in absent]
+            msg += f"🚨 **ПРОГУЛЬЩИКИ:** {', '.join(mentions)}"
+        else:
+            msg += "✨ **Все на месте!** Прогульщиков нет."
+
+        await ctx.send(msg)
+
+    except Exception as e:
+        await ctx.send(f"❌ **Ошибка проверки:**\n```{e}```")
+
+@bot.command(name="смена")
+@commands.has_any_role("Старший куратор", "Admin", "Administrator")
+async def смена(ctx):
+    """Тест: Показывает всех кураторов, записанных в график на текущий час"""
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    await ctx.send(f"🔎 Читаю график на **{now.hour}:00**...")
+
+    try:
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+        client = gspread.authorize(creds)
+
+        workers = await bot.loop.run_in_executor(
+            None,
+            get_scheduled_workers,
+            client,
+            SPREADSHEET_ID_SCHEDULE,
+            now,
+            now.hour
+        )
+
+        if workers:
+            # Формируем список с тегами
+            msg_lines = [f"👤 {worker} -> {get_mention(worker)}" for worker in workers]
+            text = "\n".join(msg_lines)
+            await ctx.send(f"✅ **В графике найдены ({len(workers)}):**\n{text}")
+        else:
+            await ctx.send("Empty... 🕸️\nВ графике на этот час никого нет (или бот не нашел строку).")
+
+    except Exception as e:
+        await ctx.send(f"❌ **Ошибка чтения графика:**\n```{e}```")
+
+@bot.command(name="старший")
+@commands.has_any_role("Старший куратор", "Admin", "Administrator")
+async def старший(ctx):
+    """Тест: Показывает, кто сейчас старший куратор по таблице"""
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    await ctx.send(f"🔎 Ищу старшего куратора на **{now.hour}:00**...")
+
+    try:
+        # Авторизуемся вручную, чтобы проверить соединение
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+        client = gspread.authorize(creds)
+
+        # Вызываем функцию поиска (в отдельном потоке, чтобы не морозить бота)
+        senior_name = await bot.loop.run_in_executor(
+            None,
+            get_senior_for_hour,
+            client,
+            SPREADSHEET_ID_SCHEDULE,
+            now,
+            now.hour
+        )
+
+        if senior_name:
+            # Превращаем имя в тег
+            mention = get_mention(senior_name)
+            await ctx.send(f"✅ **Результат:**\nВ таблице записан: **{senior_name}**\nТег для Discord: {mention}")
+        else:
+            await ctx.send("🤷‍♂️ **Результат:**\nВ таблице на этот час в колонке 'STARший' пусто или ячейка не найдена.")
+
+    except Exception as e:
+        await ctx.send(f"❌ **Ошибка:**\n```{e}```")
+
+def get_mention(ru_name):
+    """
+    Превращает Русское Имя (из таблицы) в Discord-меншен <@ID>.
+    Если пользователя нет на сервере, возвращает просто имя.
+    """
+    if not ru_name:
+        return "Неизвестный"
+
+    # 1. Ищем логин (например 'samoylovnikita') по имени
+    login = get_login_by_name(ru_name)
+    
+    if login:
+        # 2. Ищем гильдию (сервер)
+        guild = bot.get_guild(GUILD_ID)
+        if guild:
+            # 3. Ищем участника по логину (name='samoylovnikita')
+            member = discord.utils.get(guild.members, name=login)
+            if member:
+                return member.mention  # Возвращаем синий кликабельный тег
+            
+    # Если не нашли логин или участника — возвращаем просто текст
+    return ru_name
+
 @bot.event
 async def on_ready():
     print(f"Бот {bot.user} запущен!")
     logging.info(f"Бот {bot.user} запущен!")
     logging.info("База данных подключена и готова к работе")
+
+    # --- ИНИЦИАЛИЗАЦИЯ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---
+    # Чтобы команда !обнови и periodic_task видели одну и ту же переменную
+    if not hasattr(bot, 'last_collection_hour'):
+        bot.last_collection_hour = None
+    
+    if not hasattr(bot, 'last_reminder_hour'):
+        bot.last_reminder_hour = None
+        
+    if not hasattr(bot, 'last_collected_data'):
+        bot.last_collected_data = {}
+    # -------------------------------------------
 
     # --- УМНАЯ ПРОВЕРКА ЗАПУСКА ---
     # Получаем сохраненную задачу (если есть)
@@ -477,7 +655,6 @@ async def on_ready():
     logging.info("Запускаем (или перезапускаем) фоновую задачу...")
 
     # !!! ВНИМАНИЕ: Здесь исправлен отступ (ровно 4 пробела) !!!
-   # !!! ВНИМАНИЕ: Здесь исправлен отступ (ровно 4 пробела) !!!
     async def periodic_task():
         """
         Основной цикл задач бота:
@@ -487,20 +664,13 @@ async def on_ready():
         """
         await bot.wait_until_ready()
         
-        # Инициализация хранилища данных последнего часа
-        if not hasattr(bot, 'last_collected_data'):
-            bot.last_collected_data = {}
-
-        # Переменные-"защелки", чтобы действие выполнялось 1 раз в час
-        last_reminder_hour = None  # Для напоминалки
-        last_collection_hour = None # Для сбора данных
+        # Получаем канал один раз на цикл (или внутри цикла, если канал может меняться)
+        # channel = bot.get_channel(CHANNEL_ID) 
 
         while not bot.is_closed():
             try:
-                now = datetime.now()
-                # now = datetime.now(timezone.utc) + timedelta(hours=3) # Если нужно +3
-
-                # Получаем канал один раз на цикл
+                now = datetime.now(timezone.utc) + timedelta(hours=3) # Фикс времени
+                
                 channel = bot.get_channel(CHANNEL_ID)
                 if not channel:
                     logging.error(f"Канал {CHANNEL_ID} не найден!")
@@ -512,7 +682,7 @@ async def on_ready():
                 # ==========================================
                 if now.minute == Time_to_send:
                     # Проверяем, не отправляли ли мы уже в этом часе (чтобы не спамить)
-                    if last_reminder_hour != now.hour:
+                    if bot.last_reminder_hour != now.hour:
                         
                         # Проверяем, не пишет ли кто-то прямо сейчас
                         should_send = await last_message_check_is_not_chats(channel)
@@ -523,49 +693,35 @@ async def on_ready():
                         else:
                             logging.info("🔔 Призыв пропущен: уже кто-то написал или пишет.")
                         
-                        last_reminder_hour = now.hour # Запоминаем, что в этом часе напомнили
+                        bot.last_reminder_hour = now.hour # Запоминаем, что в этом часе напомнили
 
                 # ==========================================
-                # ЛОГИКА 2: СБОР ДАННЫХ И ЗАПИСЬ (В 00 минут)
+                # ЛОГИКА 2: СБОР ДАННЫХ И ЗАПИСЬ (В 05 минут)
                 # ==========================================
-                elif now.minute == 0:
+                # Почему 05, а не 00? Вы в коде выше писали now.minute == 5. 
+                # Если нужно в 00, поменяйте на now.minute == 0.
+                elif now.minute == 5:
                     # Проверяем, не собирали ли уже в этом часе
-                    if last_collection_hour != now.hour:
+                    if bot.last_collection_hour != now.hour:
                         logging.info(f"Запуск ежечасного сбора данных ({now.strftime('%H:%M')})...")
                         
-                        # 1. Собираем данные (Асинхронно, с await)
-                        # !!! ВАЖНО: Используем исправленный вызов !!!
-                        result = await bot.collector.collect_discord_data(channel)
+                        # 1. Собираем данные и пишем в таблицу (Асинхронно)
+                        data, c_hour, c_day, c_month, success, conflicts = await update_sheet(force_schedule_update=True)
                         
-                        # Распаковка
-                        curator_data = result[0]
-                        c_hour = result[1]
-                        c_day = result[2]
-                        c_month = result[3]
-                        c_dt = result[4]
-
-                        # Сохраняем в память бота для проверки через 5 минут
-                        bot.last_collected_data = curator_data
+                        # Сохраняем данные для проверки прогульщиков
+                        bot.last_collected_data = data
                         
-                        # 2. Обновляем таблицы (В потоке, так как gspread синхронный)
-                        conflicts = await bot.loop.run_in_executor(None, lambda: update_both_tables(
-                            SPREADSHEET_ID,          # ID таблицы статистики
-                            SPREADSHEET_ID_SCHEDULE, # ID таблицы расписания
-                            curator_data, 
-                            c_hour, 
-                            c_day, 
-                            c_month, 
-                            c_dt, 
-                            update_schedule=True     # Обновляем имена в графике
-                        ))
-
+                        # Если успешно — обновляем метку
+                        if success:
+                            bot.last_collection_hour = c_hour
+                        
                         # 3. Алерт о конфликтах записи (кто был записан, но не работал)
                         if conflicts and LOG_CHANNEL_ID:
                             try:
                                 creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
                                 client = gspread.authorize(creds)
                                 senior_name = get_senior_for_hour(client, SPREADSHEET_ID_SCHEDULE, now, now.hour)
-                                senior_tag = get_tag_by_name(senior_name) if senior_name else "Старший куратор"
+                                senior_tag = get_mention(senior_name)
                                 
                                 log_channel = bot.get_channel(LOG_CHANNEL_ID)
                                 if log_channel:
@@ -577,14 +733,13 @@ async def on_ready():
                                         f"*(Я их не удалял, а работающих дописал в пустые места)*."
                                     )
                             except Exception as e:
-                                logging.error(f"Ошибка при отправке алерта о конфликте: {e}")
-                        
-                        last_collection_hour = now.hour # Запоминаем, что собрали
+                                logging.error(f"Ошибка при отправке алерта о конфликте: {e}", exc_info=True)
 
                 # ==========================================
-                # ЛОГИКА 3: ПРОВЕРКА ПРОГУЛЬЩИКОВ (В XX:05)
+                # ЛОГИКА 3: ПРОВЕРКА ПРОГУЛЬЩИКОВ (В XX:05, сразу после сбора)
                 # ==========================================
-                elif now.minute == CHECK_MINUTES:
+                # Это выполняется в ту же минуту (5-ю), после сбора данных
+                if now.minute == CHECK_MINUTES:
                     # Проверяем прошлый час (если сейчас 15:05, проверяем 14:00-15:00)
                     check_hour = now.hour - 1
                     check_dt = now
@@ -603,16 +758,22 @@ async def on_ready():
                             scheduled_names = get_scheduled_workers(client, SPREADSHEET_ID_SCHEDULE, check_dt, check_hour)
                             worked_names = list(bot.last_collected_data.keys())
                             
-                            # Поиск прогульщиков
-                            absent_curators = [name for name in scheduled_names if name not in worked_names]
+                            # --- НОРМАЛИЗАЦИЯ (ё->е) ---
+                            worked_normalized = [normalize_name(n) for n in worked_names]
+                            
+                            absent_curators = []
+                            for name in scheduled_names:
+                                if normalize_name(name) not in worked_normalized:
+                                    absent_curators.append(name)
+                            # ---------------------------
                             
                             if absent_curators and LOG_CHANNEL_ID:
                                 senior_name = get_senior_for_hour(client, SPREADSHEET_ID_SCHEDULE, check_dt, check_hour)
-                                senior_tag = get_tag_by_name(senior_name) if senior_name else "Неизвестный старший"
+                                senior_tag = get_mention(senior_name)
                                 
                                 log_channel = bot.get_channel(LOG_CHANNEL_ID)
                                 if log_channel:
-                                    absent_tags = [get_tag_by_name(name) for name in absent_curators]
+                                    absent_tags = [get_mention(name) for name in absent_curators]
                                     absent_str = ", ".join(absent_tags)
                                     
                                     await log_channel.send(

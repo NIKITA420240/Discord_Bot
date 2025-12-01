@@ -1,65 +1,79 @@
-import gspread
-from google.oauth2.service_account import Credentials
 import logging
+import gspread
 from datetime import datetime, timedelta
 from gspread.utils import rowcol_to_a1
+from google.oauth2.service_account import Credentials
 
+# --- КОНСТАНТЫ ---
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 CREDENTIALS_FILE = 'credentials.json'
 
-# Константы для дат
 MONTHS_GENITIVE = {
     1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля', 5: 'мая', 6: 'июня',
     7: 'июля', 8: 'августа', 9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
 }
 
-DAYS_RU = {
+# Для Рабочих часов (куда пишем)
+DAYS_LOWER = {
     0: 'понедельник', 1: 'вторник', 2: 'среда', 3: 'четверг',
     4: 'пятница', 5: 'суббота', 6: 'воскресенье'
 }
 
-def get_weekly_sheet_name(dt):
-    """Вычисляет название листа для недели: '24 ноября - 30 ноября'"""
+# Для Расписания (откуда читаем)
+DAYS_CAPITAL = {
+    0: 'Понедельник', 1: 'Вторник', 2: 'Среда', 3: 'Четверг',
+    4: 'Пятница', 5: 'Суббота', 6: 'Воскресенье'
+}
+
+def get_sheet_name_text(dt):
+    """Формат: '01 декабря - 07 декабря'"""
     start_of_week = dt - timedelta(days=dt.weekday())
     end_of_week = start_of_week + timedelta(days=6)
     start_str = f"{start_of_week.day} {MONTHS_GENITIVE[start_of_week.month]}"
     end_str = f"{end_of_week.day} {MONTHS_GENITIVE[end_of_week.month]}"
     return f"{start_str} - {end_str}"
 
-# --- ЛОГИКА 1: СТАРАЯ (Количество чатов) ---
+def get_sheet_name_numeric(dt):
+    """Формат: '01.12.25-07.12.25'"""
+    start_of_week = dt - timedelta(days=dt.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+    start_str = start_of_week.strftime("%d.%m.%y")
+    end_str = end_of_week.strftime("%d.%m.%y")
+    return f"{start_str}-{end_str}"
+
+
+# --- 1. СТАТИСТИКА ---
 def _update_daily_stats(client, spreadsheet_id, curator_data, hour, day_str, month_str):
     try:
-        today_sheet_name = f"{day_str} {month_str}" # Пример: "28 ноября"
+        today_sheet_name = f"{day_str} {month_str}"
         spreadsheet = client.open_by_key(spreadsheet_id)
         
         try:
             worksheet = spreadsheet.worksheet(today_sheet_name)
         except gspread.WorksheetNotFound:
-            # Логика создания копии шаблона
             try:
                 template = spreadsheet.worksheet("Шаблон")
                 worksheet = template.duplicate(new_sheet_name=today_sheet_name)
                 logging.info(f"Создан лист: {today_sheet_name}")
             except Exception as e:
-                logging.error(f"Ошибка создания листа из шаблона: {e}")
+                logging.error(f"Ошибка создания листа из шаблона: {e}", exc_info=True)
                 return False
 
         all_data = worksheet.get_all_values()
         name_to_row = {}
-        # Индексируем имена (предполагаем, что имена в столбце A, начиная со 2 строки)
         for idx, row in enumerate(all_data[1:], start=2):
             if row and row[0]:
                 name_to_row[row[0].strip()] = idx
         
         updates = []
-        col_idx = hour + 2 # A=1, B=0ч, C=1ч... (проверьте смещение в вашей таблице!)
+        col_idx = hour + 2 
 
         for name, count in curator_data.items():
             if name in name_to_row:
                 row_idx = name_to_row[name]
                 val = 'o' if count == 0 else ('c' if count == -1 else count)
                 updates.append({
-                    'range': gspread.utils.rowcol_to_a1(row_idx, col_idx),
+                    'range': rowcol_to_a1(row_idx, col_idx),
                     'values': [[val]]
                 })
         
@@ -68,80 +82,64 @@ def _update_daily_stats(client, spreadsheet_id, curator_data, hour, day_str, mon
             logging.info(f"Таблица 1 (Статистика): Обновлено {len(updates)} записей.")
         return True
     except Exception as e:
-        logging.error(f"Ошибка в _update_daily_stats: {e}")
+        logging.error(f"Ошибка в _update_daily_stats: {e}", exc_info=True)
         return False
 
+# --- 2. РАБОЧИЕ ЧАСЫ ---
 def _update_weekly_schedule(client, spreadsheet_id, curator_data, hour, dt_now):
-    """
-    Умное обновление расписания:
-    1. Ищет лист недели. Если нет — создает копию из "Шаблон".
-    2. Читает текущие записи.
-    3. Дописывает работающих в пустые слоты, фиксирует конфликты.
-    """
     conflicts = [] 
-    
     try:
-        # 1. Подготовка
         active_curators = [name for name, count in curator_data.items()] 
         
-        sheet_name = get_weekly_sheet_name(dt_now) 
+        # Текстовый формат имени листа
+        sheet_name = get_sheet_name_text(dt_now) 
         spreadsheet = client.open_by_key(spreadsheet_id)
         
-        # --- ИЗМЕНЕНИЕ: Логика создания листа ---
         try:
-            # Пытаемся открыть существующий лист
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
             logging.info(f"Лист '{sheet_name}' не найден. Пробую создать из шаблона...")
             try:
-                # Если листа нет, ищем Шаблон и копируем
                 template = spreadsheet.worksheet("Шаблон")
                 worksheet = template.duplicate(new_sheet_name=sheet_name)
-                logging.info(f"Лист '{sheet_name}' успешно создан из шаблона.")
-            except gspread.WorksheetNotFound:
-                logging.error("Критическая ошибка: В таблице нет листа 'Шаблон'!")
-                return []
+                logging.info(f"Лист '{sheet_name}' успешно создан.")
             except Exception as e:
-                logging.error(f"Ошибка при копировании шаблона: {e}")
-                return []
-        # ---------------------------------------
+                logging.error(f"Ошибка при копировании шаблона: {e}", exc_info=True)
+                return None # Возвращаем None при критической ошибке
 
-        # 2. Поиск строки и диапазона
-        day_name = DAYS_RU[dt_now.weekday()] 
+        # День недели с маленькой буквы
+        day_name = DAYS_LOWER[dt_now.weekday()] 
+        
         try:
             cell_day = worksheet.find(day_name)
         except gspread.CellNotFound:
-            logging.error(f"Ошибка: На листе '{sheet_name}' (или в шаблоне) не найден день '{day_name}'.")
-            return []
+            logging.error(f"Ошибка: день '{day_name}' не найден в таблице рабочих часов.")
+            return None # Критическая ошибка
         
-        row_idx = cell_day.row + 1 + hour
-        col_start = 2 # Столбец B
+        # Смещение +1 для старого формата
+        row_idx = cell_day.row + 1 + hour 
+        col_start = 2 
         MAX_SLOTS = 10 
         
         range_start = rowcol_to_a1(row_idx, col_start)
         range_end = rowcol_to_a1(row_idx, col_start + MAX_SLOTS - 1)
         cell_range = f"{range_start}:{range_end}"
         
-        # 3. ЧИТАЕМ текущие значения
         existing_values = worksheet.get(cell_range)
-        
         current_row = existing_values[0] if existing_values else []
         while len(current_row) < MAX_SLOTS:
             current_row.append("")
 
         new_row = current_row[:] 
 
-        # 4. Анализ занятых слотов
         for idx, name_in_sheet in enumerate(current_row):
             name_in_sheet = name_in_sheet.strip()
-            
             if name_in_sheet: 
                 if name_in_sheet in active_curators:
                     active_curators.remove(name_in_sheet)
                 else:
                     conflicts.append(name_in_sheet)
         
-        # 5. Дозапись (Append)
         for worker in active_curators:
             written = False
             for idx, cell_val in enumerate(new_row):
@@ -149,116 +147,125 @@ def _update_weekly_schedule(client, spreadsheet_id, curator_data, hour, dt_now):
                     new_row[idx] = worker
                     written = True
                     break
-            
             if not written:
-                logging.warning(f"Не хватило места (MAX_SLOTS) для записи {worker}")
+                logging.warning(f"Не хватило места для записи {worker}")
 
-        # 6. Запись обновленной строки
         if new_row != current_row:
-            worksheet.update(
-                range_name=cell_range, 
-                values=[new_row], 
-                value_input_option='USER_ENTERED'
-            )
-            logging.info(f"Таблица 2: Обновлено расписание на {hour}:00.")
+            worksheet.update(range_name=cell_range, values=[new_row], value_input_option='USER_ENTERED')
+            logging.info(f"Таблица 2 (Рабочие часы): Обновлено на {hour}:00.")
         
-        return conflicts
+        return conflicts # Возвращаем список (даже если пустой - это успех)
 
     except Exception as e:
         logging.error(f"Ошибка в _update_weekly_schedule: {e}", exc_info=True)
-        return []
+        return None # None означает, что произошел сбой
 
-
-# --- ГЛАВНАЯ ФУНКЦИЯ ---
+# --- ГЛАВНАЯ ФУНКЦИЯ (ИСПРАВЛЕНА ЛОГИКА ВОЗВРАТА) ---
 def update_both_tables(spreadsheet_id_stats, spreadsheet_id_schedule, curator_data, hour, day_str, month_str, dt_now, update_schedule=False):
     """
-    Авторизуется и обновляет таблицы.
-    Возвращает список конфликтов (имен), если они есть.
+    Возвращает кортеж: (Успешно_ли_все_прошло: bool, Список_конфликтов: list)
     """
-    conflicts_found = [] # Инициализируем пустой список сразу
-    
+    conflicts_found = [] 
+    success_stats = False
+    success_schedule = True # По умолчанию True, если не обновляем
+
     try:
         if not curator_data:
-            return [] 
+            return True, [] # Нет данных - считаем что всё ок
 
-        # Авторизация
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
         client = gspread.authorize(creds)
         client.set_timeout(60)
 
-        # 1. Обновляем статистику (всегда)
-        _update_daily_stats(client, spreadsheet_id_stats, curator_data, hour, day_str, month_str)
-        
-        # 2. Обновляем расписание (только если нужно)
-        if update_schedule:
-            conflicts_found = _update_weekly_schedule(client, spreadsheet_id_schedule, curator_data, hour, dt_now)
-            logging.info("--> Обновление РАСПИСАНИЯ выполнено.")
-        else:
-            logging.info("--> Обновление расписания пропущено.")
+        # 1. Статистика
+        success_stats = _update_daily_stats(client, spreadsheet_id_stats, curator_data, hour, day_str, month_str)
+        if not success_stats:
+            logging.error("Не удалось обновить Таблицу 1 (Статистика)")
 
-        return conflicts_found 
+        # 2. Рабочие часы
+        if update_schedule:
+            result = _update_weekly_schedule(client, spreadsheet_id_schedule, curator_data, hour, dt_now)
+            if result is None:
+                success_schedule = False
+                logging.error("Не удалось обновить Таблицу 2 (Рабочие часы)")
+            else:
+                conflicts_found = result
+                success_schedule = True
+                logging.info("--> Обновление РАБОЧИХ ЧАСОВ выполнено.")
+        else:
+            logging.info("--> Обновление рабочих часов пропущено.")
+
+        # Общий успех = (удалась статистика) И (удалось расписание)
+        overall_success = success_stats and success_schedule
+        return overall_success, conflicts_found 
         
     except Exception as e:
-        logging.error(f"Критическая ошибка обновления таблиц: {e}")
-        return []
+        logging.error(f"Критическая ошибка обновления таблиц: {e}", exc_info=True)
+        return False, []
 
 def get_scheduled_workers(client, spreadsheet_id, dt_now, hour):
-    """
-    Возвращает список имен, записанных в расписании на конкретный час.
-    Нужно для проверки прогульщиков (Feature 1).
-    """
     try:
-        sheet_name = get_weekly_sheet_name(dt_now)
+        sheet_name = get_sheet_name_numeric(dt_now)
         spreadsheet = client.open_by_key(spreadsheet_id)
         worksheet = spreadsheet.worksheet(sheet_name)
         
-        day_name = DAYS_RU[dt_now.weekday()]
-        cell_day = worksheet.find(day_name)
-        
-        target_row = cell_day.row + 1 + hour
-        # Читаем строку (пропуская колонку А)
-        row_values = worksheet.row_values(target_row)
-        
-        if len(row_values) < 2:
+        day_name = DAYS_CAPITAL[dt_now.weekday()]
+        try:
+            cell_day = worksheet.find(day_name)
+        except gspread.CellNotFound:
+            logging.error(f"День '{day_name}' не найден в расписании.")
             return []
             
-        # Очищаем от пустых строк и пробелов
-        scheduled_names = [n.strip() for n in row_values[1:] if n.strip()]
-        return scheduled_names
+        target_row = cell_day.row + hour
+        row_values = worksheet.row_values(target_row)
+        
+        # Проверка, что строка достаточно длинная
+        if len(row_values) < 3: 
+            return []
+            
+        # 1. Берем Старшего (Колонка C, индекс 2)
+        senior = row_values[2].strip()
+        
+        # 2. Берем остальных (с Колонки E (индекс 4) до конца)
+        # Пропускаем: [0] День, [1] Час, [3] Итого
+        others = [n.strip() for n in row_values[4:] if n.strip()]
+        
+        # 3. Объединяем
+        all_workers = []
+        if senior:
+            all_workers.append(senior)
+        all_workers.extend(others)
+        
+        # 4. Убираем дубликаты (чтобы старший не двоился) и возвращаем
+        return list(set(all_workers))
+
     except Exception as e:
-        logging.error(f"Ошибка чтения расписания: {e}")
+        logging.error(f"Ошибка чтения расписания: {e}", exc_info=True)
         return []
 
-
+        
 def get_senior_for_hour(client, spreadsheet_id, dt_now, hour):
-    """
-    Возвращает имя старшего куратора (из колонки C) на заданный час.
-    """
     try:
-        sheet_name = get_weekly_sheet_name(dt_now)
+        sheet_name = get_sheet_name_numeric(dt_now)
         spreadsheet = client.open_by_key(spreadsheet_id)
         
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
+            logging.error(f"Лист расписания '{sheet_name}' не найден.")
             return None
 
-        day_name = DAYS_RU[dt_now.weekday()]
-        
-        # Находим день
+        day_name = DAYS_CAPITAL[dt_now.weekday()]
         try:
             cell_day = worksheet.find(day_name)
         except gspread.CellNotFound:
+            logging.error(f"День '{day_name}' не найден.")
             return None
             
-        # Вычисляем строку (День + 1 строка заголовка + час)
-        target_row = cell_day.row + 1 + hour
-        
-        # Колонка C (STARший) — это 3-я колонка
+        target_row = cell_day.row + hour # Без +1 для нового формата
         senior_name = worksheet.cell(target_row, 3).value
-        
         return senior_name.strip() if senior_name else None
 
     except Exception as e:
-        logging.error(f"Ошибка получения старшего куратора: {e}")
+        logging.error(f"Ошибка получения старшего: {e}", exc_info=True)
         return None

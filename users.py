@@ -83,9 +83,17 @@ user_map = {
 }
 
 
-def get_tag_by_name(name):
-    """Возвращает меншен <@ID> или просто имя, если ID нет."""
-    user_id = NAME_TO_ID.get(name.strip())
-    if user_id:
-        return f"<@{user_id}>"
-    return name
+
+
+def get_login_by_name(target_name):
+    """Ищет логин (ключ) по русскому имени."""
+    if not target_name:
+        return None
+    
+    target_name = target_name.strip()
+    
+    # Пробегаем по словарю: ключ=login, значение=name
+    for login, name in user_map.items():
+        if name.strip() == target_name:
+            return login
+    return None
