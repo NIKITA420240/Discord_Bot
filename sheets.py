@@ -74,76 +74,78 @@ def _update_daily_stats(client, spreadsheet_id, curator_data, hour, day_str, mon
 def _update_weekly_schedule(client, spreadsheet_id, curator_data, hour, dt_now):
     """
     Умное обновление расписания:
-    1. Читает текущие записи в слотах.
-    2. Если слот занят:
-       - Если имя совпадает с тем, кто сдал отчет -> ок.
-       - Если имя чужое -> добавляет в список конфликтов (для тега старшего).
-    3. Дописывает тех, кто сдал отчет, но кого нет в таблице, в пустые слоты.
-    
-    Returns:
-        list: Список имен (конфликтов), которые были в таблице, но не сдали отчет.
+    1. Ищет лист недели. Если нет — создает копию из "Шаблон".
+    2. Читает текущие записи.
+    3. Дописывает работающих в пустые слоты, фиксирует конфликты.
     """
-    conflicts = [] # Список "чужаков" в расписании
+    conflicts = [] 
     
     try:
-        # 1. Подготовка (как раньше)
-        active_curators = [name for name, count in curator_data.items()] # Те, кто сдал отчет (работал)
+        # 1. Подготовка
+        active_curators = [name for name, count in curator_data.items()] 
         
         sheet_name = get_weekly_sheet_name(dt_now) 
         spreadsheet = client.open_by_key(spreadsheet_id)
         
+        # --- ИЗМЕНЕНИЕ: Логика создания листа ---
         try:
+            # Пытаемся открыть существующий лист
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
-            logging.warning(f"Таблица 2: Лист '{sheet_name}' не найден.")
-            return []
+            logging.info(f"Лист '{sheet_name}' не найден. Пробую создать из шаблона...")
+            try:
+                # Если листа нет, ищем Шаблон и копируем
+                template = spreadsheet.worksheet("Шаблон")
+                worksheet = template.duplicate(new_sheet_name=sheet_name)
+                logging.info(f"Лист '{sheet_name}' успешно создан из шаблона.")
+            except gspread.WorksheetNotFound:
+                logging.error("Критическая ошибка: В таблице нет листа 'Шаблон'!")
+                return []
+            except Exception as e:
+                logging.error(f"Ошибка при копировании шаблона: {e}")
+                return []
+        # ---------------------------------------
 
         # 2. Поиск строки и диапазона
         day_name = DAYS_RU[dt_now.weekday()] 
-        cell_day = worksheet.find(day_name)
+        try:
+            cell_day = worksheet.find(day_name)
+        except gspread.CellNotFound:
+            logging.error(f"Ошибка: На листе '{sheet_name}' (или в шаблоне) не найден день '{day_name}'.")
+            return []
         
         row_idx = cell_day.row + 1 + hour
         col_start = 2 # Столбец B
-        MAX_SLOTS = 10 # Сколько ячеек отведено под имена
+        MAX_SLOTS = 10 
         
-        # Получаем диапазон ячеек (например B10:K10)
         range_start = rowcol_to_a1(row_idx, col_start)
         range_end = rowcol_to_a1(row_idx, col_start + MAX_SLOTS - 1)
         cell_range = f"{range_start}:{range_end}"
         
-        # 3. ЧИТАЕМ текущие значения (важно!)
-        # get возвращает список списков [['Имя1', 'Имя2', '', ...]]
+        # 3. ЧИТАЕМ текущие значения
         existing_values = worksheet.get(cell_range)
         
-        # Превращаем в плоский список и дополняем пустыми строками до MAX_SLOTS, если список короче
         current_row = existing_values[0] if existing_values else []
         while len(current_row) < MAX_SLOTS:
             current_row.append("")
 
-        new_row = current_row[:] # Копия для редактирования
+        new_row = current_row[:] 
 
         # 4. Анализ занятых слотов
-        # Проходимся по тем, кто УЖЕ записан в таблице
         for idx, name_in_sheet in enumerate(current_row):
             name_in_sheet = name_in_sheet.strip()
             
-            if name_in_sheet: # Если слот не пустой
+            if name_in_sheet: 
                 if name_in_sheet in active_curators:
-                    # Куратор есть в таблице И сдал отчет.
-                    # Убираем его из списка active_curators, так как он "обработан"
                     active_curators.remove(name_in_sheet)
                 else:
-                    # В таблице записан кто-то, кто НЕ сдал отчет (или это ошибка)
-                    # Мы его НЕ стираем (как просили), но запоминаем конфликт
                     conflicts.append(name_in_sheet)
         
         # 5. Дозапись (Append)
-        # Оставшиеся в active_curators — это те, кто сдал отчет, но их нет в таблице.
-        # Ищем для них пустые места.
         for worker in active_curators:
             written = False
             for idx, cell_val in enumerate(new_row):
-                if cell_val == "": # Нашли пустое место
+                if cell_val == "": 
                     new_row[idx] = worker
                     written = True
                     break
@@ -151,15 +153,14 @@ def _update_weekly_schedule(client, spreadsheet_id, curator_data, hour, dt_now):
             if not written:
                 logging.warning(f"Не хватило места (MAX_SLOTS) для записи {worker}")
 
-        # 6. Запись обновленной строки обратно
-        # Сравниваем, изменилось ли что-то, чтобы зря не дёргать API
+        # 6. Запись обновленной строки
         if new_row != current_row:
             worksheet.update(
                 range_name=cell_range, 
                 values=[new_row], 
                 value_input_option='USER_ENTERED'
             )
-            logging.info(f"Таблица 2: Обновлено расписание на {hour}:00. Дописаны недостающие.")
+            logging.info(f"Таблица 2: Обновлено расписание на {hour}:00.")
         
         return conflicts
 
