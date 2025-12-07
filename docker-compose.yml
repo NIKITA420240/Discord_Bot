@@ -1,18 +1,36 @@
 version: '3.8'
 
 services:
+  # 1. Основной бот (Ваш текущий сервис)
   discord-bot:
     build: .
     container_name: discord-bot-v2
     restart: unless-stopped
     volumes:
-      # Монтируем файл .env для переменных окружения
       - ./.env:/app/.env:ro
-      # Монтируем credentials.json для Google Sheets API
       - ./credentials.json:/app/credentials.json:ro
-      # Монтируем файлы данных напрямую
       - ./bot.log:/app/bot.log
-      - ./bot_database.db:/app/bot_database.db
+      - ./bot_database.db:/app/bot_database.db  # Бот пишет сюда данные
+    environment:
+      - TZ=Europe/Moscow
+    networks:
+      - bot-network
+
+  # 2. Веб-дашборд (Новый сервис)
+  dashboard:
+    build: .
+    container_name: bot-dashboard
+    restart: unless-stopped
+    # Команда запуска streamlit вместо бота
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    volumes:
+      - ./.env:/app/.env:ro
+      # Самое важное: монтируем ту же базу данных (можно только для чтения :ro)
+      - ./bot_database.db:/app/bot_database.db:ro
+      # Монтируем файл скрипта, чтобы можно было править код сайта без перезагрузки
+      - ./dashboard.py:/app/dashboard.py
+    ports:
+      - "8501:8501"  # Открываем порт в мир
     environment:
       - TZ=Europe/Moscow
     networks:
@@ -21,5 +39,3 @@ services:
 networks:
   bot-network:
     driver: bridge
-
- 
