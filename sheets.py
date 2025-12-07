@@ -215,29 +215,74 @@ def get_scheduled_workers(client, spreadsheet_id, dt_now, hour):
         except gspread.CellNotFound:
             logging.error(f"День '{day_name}' не найден в расписании.")
             return []
-            
+
+        # --- ШАГ 1: Находим индексы колонок "Веб" ---
+        web_indices = set()
+        # Сканируем шапку (первые 10 строк)
+        header_data = worksheet.get("A1:AX10")
+        
+        for row in header_data:
+            # Если в строке есть "веб"
+            if any("веб" in str(x).lower() for x in row):
+                is_web_merge_block = False 
+                for c_idx, val in enumerate(row):
+                    txt = str(val).lower().strip()
+                    
+                    # Начало блока "Веб"
+                    if "веб" in txt:
+                        web_indices.add(c_idx)
+                        is_web_merge_block = True
+                    # Продолжение блока (пустая ячейка справа от Веб) - для объединенных ячеек
+                    elif is_web_merge_block and txt == "":
+                        web_indices.add(c_idx)
+                    # Блок закончился (встретили другой текст)
+                    elif txt != "":
+                        is_web_merge_block = False
+                
+                if web_indices:
+                    logging.info(f"Колонки вебинара (исключаем): {web_indices}")
+                    break 
+        # ---------------------------------------------
+
         target_row = cell_day.row + hour
         row_values = worksheet.row_values(target_row)
         
-        # Проверка, что строка достаточно длинная
         if len(row_values) < 3: 
             return []
             
-        # 1. Берем Старшего (Колонка C, индекс 2)
-        senior = row_values[2].strip()
+        # --- ШАГ 2: Собираем "Кого исключить" (кто на вебинаре) ---
+        names_to_exclude = set()
+        for idx in web_indices:
+            # Проверяем, есть ли такой индекс в строке (строка может быть короче)
+            if idx < len(row_values):
+                val = row_values[idx].strip()
+                if val:
+                    names_to_exclude.add(val)
         
-        # 2. Берем остальных (с Колонки E (индекс 4) до конца)
-        # Пропускаем: [0] День, [1] Час, [3] Итого
-        others = [n.strip() for n in row_values[4:] if n.strip()]
+        if names_to_exclude:
+            logging.info(f"На вебинаре в {hour}:00 -> {names_to_exclude}")
+
+        # --- ШАГ 3: Собираем всех (Старший + Остальные) ---
+        candidates = set()
         
-        # 3. Объединяем
-        all_workers = []
-        if senior:
-            all_workers.append(senior)
-        all_workers.extend(others)
+        # 3.1 Старший (Колонка C = индекс 2)
+        if len(row_values) > 2:
+            senior = row_values[2].strip()
+            if senior: candidates.add(senior)
+            
+        # 3.2 Остальные (начинаем с колонки E = индекс 4)
+        # (Мы берем ВСЕХ, даже тех кто в колонке Веб, а потом отфильтруем)
+        start_col = 4 
+        for val in row_values[start_col:]:
+            name = val.strip()
+            if name:
+                candidates.add(name)
         
-        # 4. Убираем дубликаты (чтобы старший не двоился) и возвращаем
-        return list(set(all_workers))
+        # --- ШАГ 4: Фильтрация (Все минус Вебинарщики) ---
+        # Убираем тех, кто был найден в колонках Веб
+        final_workers = list(candidates - names_to_exclude)
+        
+        return final_workers
 
     except Exception as e:
         logging.error(f"Ошибка чтения расписания: {e}", exc_info=True)
