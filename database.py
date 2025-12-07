@@ -296,3 +296,42 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка при получении статистики по часам: {e}")
             return [] 
+
+    def get_counts_for_hour(self, date_obj):
+        """Возвращает словарь {Имя: Кол-во} за указанный час и дату"""
+        target_date = date_obj.strftime("%Y-%m-%d")
+        target_hour = date_obj.hour
+        
+        query = """
+        SELECT username, message_text 
+        FROM messages 
+        WHERE date(message_date) = ? AND strftime('%H', message_date) = ?
+        """
+        # SQLite format for hour might need care: strftime('%H', ...) returns '09', so passing formatted string is safer
+        
+        # Проще так: ищем по диапазону или точному совпадению
+        # Но у нас формат даты в базе YYYY-MM-DD HH:MM:SS
+        
+        cursor = self.conn.cursor()
+        # Хитрость: фильтруем по строке
+        hour_str = f"{target_hour:02d}" # "09", "14"
+        
+        cursor.execute("""
+            SELECT username, message_text
+            FROM messages
+            WHERE date(message_date) = ? AND strftime('%H', message_date) = ?
+            ORDER BY created_at ASC
+        """, (target_date, hour_str))
+        
+        rows = cursor.fetchall()
+        
+        result = {}
+        for user, text in rows:
+            # Берем последнее значение (если человек исправлял отчет, в базе может быть несколько записей, но нам нужна последняя или сумма? 
+            # В старой логике бот брал последнее сообщение.
+            # Тут мы просто перезаписываем result[user], так что останется последнее, если SQL выдает в хронологическом порядке)
+            try:
+                result[user] = int(text)
+            except:
+                pass
+        return result

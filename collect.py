@@ -135,7 +135,9 @@ class DataCollector:
             
         # !!! ИЗМЕНЕНИЕ: Возвращаем dt_object последним элементом вместо строки message_date
         # dt_object - это datetime, который нужен для sheets.py
-        return curator_data, hour, day, month_name, dt_object
+        final_curator_data = self.db_manager.get_counts_for_hour(now)
+        
+        return final_curator_data, target_hour, day_str, month_name_ru
 
     def get_stats_from_db(self, message_date: str, message_hour: int):
         """Получает статистику из базы данных"""

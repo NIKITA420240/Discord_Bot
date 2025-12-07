@@ -56,7 +56,7 @@ class MyBot(commands.Bot):
         self.collector = DataCollector(db_manager)
         
         # Загрузка когов (модулей)
-        cogs_list = ['cogs.admin', 'cogs.stats', 'cogs.tasks', 'cogs.fun']
+        cogs_list = ['cogs.admin', 'cogs.stats', 'cogs.tasks', 'cogs.fun', 'cogs.buttons']
         for cog in cogs_list:
             try:
                 await self.load_extension(cog)

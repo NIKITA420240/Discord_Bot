@@ -11,6 +11,7 @@ import gspread
 from sheets import update_both_tables, get_scheduled_workers, get_senior_for_hour
 from utils import Time_to_send, CHECK_MINUTES, SCOPES, CREDENTIALS_FILE
 from users import get_login_by_name
+from cogs.buttons import ReportView
 
 def normalize_name(name):
     if not name: return ""
@@ -80,8 +81,15 @@ class Tasks(commands.Cog):
                 if now.minute == Time_to_send:
                     if self.bot.last_reminder_hour != now.hour:
                         if channel:
-                            await channel.send(f"Пишите количество чатов за {now.hour} час. НЕ ПИШИТЕ в {Time_to_send} МИНУТ!!!")
-                            logging.info(f"🔔 Напоминание отправлено: {now.hour}:00")
+                            # Создаем View (кнопку)
+                            # Нам нужен доступ к db_manager. В bot.py мы привязали его к collector
+                            view = ReportView(self.bot.collector.db_manager, self.bot)
+                            
+                            await channel.send(
+                                f"🔔 **Напоминание!**\nПишите количество чатов за **{now.hour}** час.\nНажмите кнопку ниже, чтобы сдать отчет:",
+                                view=view
+                            )
+                            logging.info(f"🔔 Напоминание с кнопкой отправлено: {now.hour}:00")
                         self.bot.last_reminder_hour = now.hour
 
                 # 2. Сбор данных (xx:05)
