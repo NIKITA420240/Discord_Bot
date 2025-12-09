@@ -68,4 +68,32 @@ user_map = {
     "mirra.mm":"Малюгина Мирра",
     "maxoffkeksov":"Азизов Максим",
     "kriska_impershka":"Буйских Антон",
+    ".c_plus_plus": "Андреев Алексей",
+    "kibersashka": "Вельдяева Александра",
+    "ad006847": "Коротышев Артём",
+    "vnikal": "Леонова Вероника",
+    "ettami": "Панькина Любовь",
+    "vladimirr0364": "Резник Владимир",
+    "2sp1k": "Тянников Семён",
+    "fristailik2429": "Черняев Тимур",
+    "ma_xer": "Шокман Максим",
+    "denchilla": "Власов Даниил",
+    "tortchik": "Картышов Владимир",
+    "wessy5353": "Стешин Алексей"
 }
+
+
+
+
+def get_login_by_name(target_name):
+    """Ищет логин (ключ) по русскому имени."""
+    if not target_name:
+        return None
+    
+    target_name = target_name.strip()
+    
+    # Пробегаем по словарю: ключ=login, значение=name
+    for login, name in user_map.items():
+        if name.strip() == target_name:
+            return login
+    return None

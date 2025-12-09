@@ -4,3 +4,10 @@ gspread
 google-auth
 google-auth-oauthlib
 pandas
+matplotlib
+huggingface_hub
+google-api-python-client
+streamlit
+pandas
+plotly
+reportlab
