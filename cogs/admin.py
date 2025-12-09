@@ -2,13 +2,9 @@ import discord
 from discord.ext import commands
 import logging
 from datetime import datetime, timedelta, timezone
-import gspread
-from google.oauth2.service_account import Credentials
 import os
 
-from utils import SCOPES, CREDENTIALS_FILE
 from sheets import get_scheduled_workers, get_senior_for_hour
-# УБРАЛИ: from users import get_login_by_name
 
 def normalize_name(name):
     if not name: return ""
@@ -18,14 +14,10 @@ class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.GUILD_ID = int(os.getenv("GUILD_ID"))
-        self.CREDENTIALS_FILE = CREDENTIALS_FILE
-        self.SCOPES = SCOPES
         self.SPREADSHEET_ID_SCHEDULE = os.getenv("SPREADSHEET_ID_SCHEDULE")
 
-    # Вспомогательная функция теперь метод класса, чтобы иметь доступ к БД
     def get_mention(self, ru_name):
         if not ru_name: return "Неизвестный"
-        # Ищем через БД
         login = self.bot.collector.db_manager.get_discord_id_by_name(ru_name)
         if login:
             guild = self.bot.get_guild(self.GUILD_ID)
@@ -34,14 +26,11 @@ class Admin(commands.Cog):
                 if member: return member.mention
         return ru_name
 
-    # --- НОВЫЕ КОМАНДЫ ---
-
+    # --- КОМАНДЫ УПРАВЛЕНИЯ КУРАТОРАМИ ---
     @commands.command(name="добавить")
     @commands.has_any_role("Старший куратор", "Admin", "Administrator")
     async def add_curator(self, ctx, member: discord.Member, *, full_name: str):
-        """Добавить куратора: !добавить @user Фамилия Имя"""
-        discord_id = str(member.name) # Берем username (новый формат)
-        
+        discord_id = str(member.name)
         if self.bot.collector.db_manager.add_user(discord_id, full_name):
             await ctx.send(f"✅ Куратор добавлен: {member.mention} -> {full_name}")
             logging.info(f"Admin added user: {discord_id} -> {full_name}")
@@ -51,9 +40,7 @@ class Admin(commands.Cog):
     @commands.command(name="удалить")
     @commands.has_any_role("Старший куратор", "Admin", "Administrator")
     async def remove_curator(self, ctx, member: discord.Member):
-        """Удалить куратора: !удалить @user"""
         discord_id = str(member.name)
-        
         if self.bot.collector.db_manager.remove_user(discord_id):
             await ctx.send(f"🗑️ Куратор удален: {member.mention}")
             logging.info(f"Admin removed user: {discord_id}")
@@ -63,14 +50,12 @@ class Admin(commands.Cog):
     @commands.command(name="список")
     @commands.has_any_role("Старший куратор", "Admin", "Administrator")
     async def list_curators(self, ctx):
-        """Показать список всех кураторов в базе"""
         users = self.bot.collector.db_manager.get_all_users()
         if not users:
             await ctx.send("База кураторов пуста.")
             return
             
         msg = "**Список кураторов:**\n"
-        # Разбиваем на части, если слишком длинное
         buffer = ""
         for login, name in users:
             line = f"`{login}`: {name}\n"
@@ -82,12 +67,11 @@ class Admin(commands.Cog):
         if buffer:
             await ctx.send(buffer)
 
-    # --- СТАРЫЕ КОМАНДЫ (Обновленные вызовы get_mention) ---
-
+    # --- ОСНОВНЫЕ КОМАНДЫ ---
     @commands.command(name="обнови")
     @commands.has_any_role("Старший куратор", "Admin", "Administrator")
     async def обнови(self, ctx):
-        await ctx.send("🔄 Собираю данные и принудительно обновляю таблицы...")
+        await ctx.send("🔄 Собираю данные и принудительно обновляю таблицы (Async)...")
         tasks_cog = self.bot.get_cog('Tasks')
         if not tasks_cog:
             await ctx.send("❌ Ошибка: Модуль задач не загружен.")
@@ -95,6 +79,10 @@ class Admin(commands.Cog):
 
         data, hour, day, month_name, success, conflicts = await tasks_cog.update_sheet(force_schedule_update=True)
         
+        if success:
+            self.bot.last_collected_data = data
+            self.bot.last_collection_hour = hour
+
         status = "успешно" if success else "с ошибками"
         msg = f"✅ Готово! Статус: {status}.\nОбработано: {len(data)} записей за {day} {month_name}, {hour}:00."
         if conflicts:
@@ -110,17 +98,17 @@ class Admin(commands.Cog):
 
         now = datetime.now(timezone.utc) + timedelta(hours=3)
         check_hour = now.hour
+
+        if self.bot.last_collection_hour is not None and self.bot.last_collection_hour != check_hour:
+             await ctx.send(f"⚠️ **Внимание:** Вы проверяете прогульщиков на {check_hour}:00, но данные собраны за {self.bot.last_collection_hour}:00 (выполните `!обнови`, если нужно актуализировать).")
+
         await ctx.send(f"⚖️ **Сравниваю:** График на {check_hour}:00")
 
         try:
-            creds = Credentials.from_service_account_file(self.CREDENTIALS_FILE, scopes=self.SCOPES)
-            client = gspread.authorize(creds)
-
-            scheduled = await self.bot.loop.run_in_executor(
-                None, get_scheduled_workers, client, self.SPREADSHEET_ID_SCHEDULE, now, check_hour
-            )
-            worked = list(self.bot.last_collected_data.keys())
+            # Вызываем асинхронную функцию (клиент создается внутри нее)
+            scheduled = await get_scheduled_workers(self.SPREADSHEET_ID_SCHEDULE, now, check_hour)
             
+            worked = list(self.bot.last_collected_data.keys())
             worked_norm = [normalize_name(n) for n in worked]
             absent = [name for name in scheduled if normalize_name(name) not in worked_norm]
 
@@ -129,7 +117,6 @@ class Admin(commands.Cog):
             msg += "---------------------------------\n"
             
             if absent:
-                # Используем self.get_mention
                 mentions = [self.get_mention(name) for name in absent]
                 msg += f"🚨 **ПРОГУЛЬЩИКИ:** {', '.join(mentions)}"
             else:
@@ -144,11 +131,7 @@ class Admin(commands.Cog):
         now = datetime.now(timezone.utc) + timedelta(hours=3)
         await ctx.send(f"🔎 Читаю график на **{now.hour}:00**...")
         try:
-            creds = Credentials.from_service_account_file(self.CREDENTIALS_FILE, scopes=self.SCOPES)
-            client = gspread.authorize(creds)
-            workers = await self.bot.loop.run_in_executor(
-                None, get_scheduled_workers, client, self.SPREADSHEET_ID_SCHEDULE, now, now.hour
-            )
+            workers = await get_scheduled_workers(self.SPREADSHEET_ID_SCHEDULE, now, now.hour)
             if workers:
                 lines = [f"👤 {w} -> {self.get_mention(w)}" for w in workers]
                 await ctx.send(f"✅ **В графике ({len(workers)}):**\n" + "\n".join(lines))
@@ -162,11 +145,7 @@ class Admin(commands.Cog):
     async def старший(self, ctx):
         now = datetime.now(timezone.utc) + timedelta(hours=3)
         try:
-            creds = Credentials.from_service_account_file(self.CREDENTIALS_FILE, scopes=self.SCOPES)
-            client = gspread.authorize(creds)
-            senior = await self.bot.loop.run_in_executor(
-                None, get_senior_for_hour, client, self.SPREADSHEET_ID_SCHEDULE, now, now.hour
-            )
+            senior = await get_senior_for_hour(self.SPREADSHEET_ID_SCHEDULE, now, now.hour)
             if senior:
                 await ctx.send(f"👑 **Старший:** {senior} ({self.get_mention(senior)})")
             else:

@@ -4,16 +4,9 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from functools import partial
-from google.oauth2.service_account import Credentials
-import gspread
 
-from sheets import update_both_tables, get_scheduled_workers, get_senior_for_hour
-from utils import Time_to_send, CHECK_MINUTES, SCOPES, CREDENTIALS_FILE
-
-def normalize_name(name):
-    if not name: return ""
-    return name.lower().replace('ё', 'е').strip()
+from sheets import update_both_tables
+from utils import Time_to_send, CHECK_MINUTES
 
 class Tasks(commands.Cog):
     def __init__(self, bot):
@@ -32,28 +25,31 @@ class Tasks(commands.Cog):
         self.bg_task.cancel()
 
     async def update_sheet(self, force_schedule_update=False):
-        """Логика обновления (вынесена, чтобы можно было вызывать из команд)"""
+        """Логика обновления: Скрапинг -> БД -> Async Google Sheets"""
         guild = self.bot.get_guild(self.GUILD_ID)
         if not guild: return {}, 0, 0, "", False, []
         channel = guild.get_channel(self.CHANNEL_ID)
         if not channel: return {}, 0, 0, "", False, []
 
-        result = await self.bot.collector.collect_discord_data(channel)
-        curator_data, hour, day, month_name, dt_obj = result
+        # 1. Скрапинг чата
+        scrape_result = await self.bot.collector.collect_discord_data(channel)
+        _, hour, day, month_name, dt_obj = scrape_result
+        
+        message_date_str = dt_obj.strftime('%Y-%m-%d')
+
+        # 2. Полные данные из БД
+        curator_data = self.bot.collector.db_manager.get_curator_stats_for_hour(message_date_str, hour)
+        
+        logging.info(f"📤 Отправка в Google Sheets: {len(curator_data)} записей (Async)")
 
         if curator_data:
-            loop = asyncio.get_running_loop()
-            update_result = await loop.run_in_executor(
-                None, 
-                partial(
-                    update_both_tables, 
-                    self.SPREADSHEET_ID, 
-                    self.SPREADSHEET_ID_WORK_HOURS, 
-                    curator_data, hour, day, month_name, dt_obj,
-                    force_schedule_update
-                )
+            # Вызываем асинхронную функцию напрямую
+            is_success, conflicts = await update_both_tables(
+                self.SPREADSHEET_ID, 
+                self.SPREADSHEET_ID_WORK_HOURS, 
+                curator_data, hour, day, month_name, dt_obj,
+                force_schedule_update
             )
-            is_success, conflicts = update_result
             return curator_data, hour, day, month_name, is_success, conflicts
         else:
             return {}, hour, day, month_name, True, []
@@ -81,23 +77,16 @@ class Tasks(commands.Cog):
                         logging.info(f"🚀 Авто-сбор данных за {now.hour}:00...")
                         data, c_hour, _, _, success, conflicts = await self.update_sheet(force_schedule_update=True)
                         
-                        self.bot.last_collected_data = data
                         if success:
+                            self.bot.last_collected_data = data
                             self.bot.last_collection_hour = c_hour
                         
-                        # Алерты о конфликтах
                         if conflicts and self.LOG_CHANNEL_ID:
                             log_ch = self.bot.get_channel(self.LOG_CHANNEL_ID)
                             if log_ch:
                                 await log_ch.send(f"✏️ **Конфликт записи:** {', '.join(conflicts)}")
 
-                # 3. Проверка прогулов (xx:05 или CHECK_MINUTES)
-                if now.minute == CHECK_MINUTES:
-                     # Проверка прогульщиков (логика из старого бота)
-                     # ... (можно добавить сюда ту же логику, что в !тест_прогул)
-                     pass
-
-                # Умный сон до следующей минуты
+                # Умный сон
                 sleep_sec = 60 - datetime.now().second
                 await asyncio.sleep(sleep_sec + 0.5)
 

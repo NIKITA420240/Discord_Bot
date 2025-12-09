@@ -67,6 +67,13 @@ class MyBot(commands.Bot):
     async def on_ready(self):
         logging.info(f"Бот {self.user} запущен! (Режим Cogs)")
         logging.info(f"Guild ID: {GUILD_ID}")
+        
+        # --- ДОБАВЛЕНО: Синхронизация слэш-команд ---
+        try:
+            synced = await self.tree.sync()
+            logging.info(f"🔄 Синхронизировано {len(synced)} слэш-команд(ы)")
+        except Exception as e:
+            logging.error(f"❌ Ошибка синхронизации команд: {e}")
 
 if __name__ == "__main__":
     bot = MyBot()
