@@ -10,19 +10,10 @@ import gspread
 
 from sheets import update_both_tables, get_scheduled_workers, get_senior_for_hour
 from utils import Time_to_send, CHECK_MINUTES, SCOPES, CREDENTIALS_FILE
-from users import get_login_by_name
 
 def normalize_name(name):
     if not name: return ""
     return name.lower().replace('ё', 'е').strip()
-
-def get_mention(ru_name, guild):
-    if not ru_name: return "Неизвестный"
-    login = get_login_by_name(ru_name)
-    if login and guild:
-        member = discord.utils.get(guild.members, name=login)
-        if member: return member.mention
-    return ru_name
 
 class Tasks(commands.Cog):
     def __init__(self, bot):

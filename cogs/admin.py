@@ -6,19 +6,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 import os
 
-# Импорт ваших утилит
 from utils import SCOPES, CREDENTIALS_FILE
-from sheets import get_scheduled_workers, get_senior_for_hour, update_both_tables
-from users import get_login_by_name
-
-# Вспомогательная функция для меншенов (копируем сюда или импортируем)
-def get_mention(ru_name, guild):
-    if not ru_name: return "Неизвестный"
-    login = get_login_by_name(ru_name)
-    if login and guild:
-        member = discord.utils.get(guild.members, name=login)
-        if member: return member.mention
-    return ru_name
+from sheets import get_scheduled_workers, get_senior_for_hour
+# УБРАЛИ: from users import get_login_by_name
 
 def normalize_name(name):
     if not name: return ""
@@ -32,18 +22,77 @@ class Admin(commands.Cog):
         self.SCOPES = SCOPES
         self.SPREADSHEET_ID_SCHEDULE = os.getenv("SPREADSHEET_ID_SCHEDULE")
 
+    # Вспомогательная функция теперь метод класса, чтобы иметь доступ к БД
+    def get_mention(self, ru_name):
+        if not ru_name: return "Неизвестный"
+        # Ищем через БД
+        login = self.bot.collector.db_manager.get_discord_id_by_name(ru_name)
+        if login:
+            guild = self.bot.get_guild(self.GUILD_ID)
+            if guild:
+                member = discord.utils.get(guild.members, name=login)
+                if member: return member.mention
+        return ru_name
+
+    # --- НОВЫЕ КОМАНДЫ ---
+
+    @commands.command(name="добавить")
+    @commands.has_any_role("Старший куратор", "Admin", "Administrator")
+    async def add_curator(self, ctx, member: discord.Member, *, full_name: str):
+        """Добавить куратора: !добавить @user Фамилия Имя"""
+        discord_id = str(member.name) # Берем username (новый формат)
+        
+        if self.bot.collector.db_manager.add_user(discord_id, full_name):
+            await ctx.send(f"✅ Куратор добавлен: {member.mention} -> {full_name}")
+            logging.info(f"Admin added user: {discord_id} -> {full_name}")
+        else:
+            await ctx.send("❌ Ошибка при добавлении в базу данных.")
+
+    @commands.command(name="удалить")
+    @commands.has_any_role("Старший куратор", "Admin", "Administrator")
+    async def remove_curator(self, ctx, member: discord.Member):
+        """Удалить куратора: !удалить @user"""
+        discord_id = str(member.name)
+        
+        if self.bot.collector.db_manager.remove_user(discord_id):
+            await ctx.send(f"🗑️ Куратор удален: {member.mention}")
+            logging.info(f"Admin removed user: {discord_id}")
+        else:
+            await ctx.send("❌ Куратор не найден или ошибка БД.")
+
+    @commands.command(name="список")
+    @commands.has_any_role("Старший куратор", "Admin", "Administrator")
+    async def list_curators(self, ctx):
+        """Показать список всех кураторов в базе"""
+        users = self.bot.collector.db_manager.get_all_users()
+        if not users:
+            await ctx.send("База кураторов пуста.")
+            return
+            
+        msg = "**Список кураторов:**\n"
+        # Разбиваем на части, если слишком длинное
+        buffer = ""
+        for login, name in users:
+            line = f"`{login}`: {name}\n"
+            if len(buffer) + len(line) > 1900:
+                await ctx.send(buffer)
+                buffer = line
+            else:
+                buffer += line
+        if buffer:
+            await ctx.send(buffer)
+
+    # --- СТАРЫЕ КОМАНДЫ (Обновленные вызовы get_mention) ---
+
     @commands.command(name="обнови")
     @commands.has_any_role("Старший куратор", "Admin", "Administrator")
     async def обнови(self, ctx):
         await ctx.send("🔄 Собираю данные и принудительно обновляю таблицы...")
-        
-        # Вызываем функцию update_sheet из модуля Tasks
         tasks_cog = self.bot.get_cog('Tasks')
         if not tasks_cog:
             await ctx.send("❌ Ошибка: Модуль задач не загружен.")
             return
 
-        # force_schedule_update=True
         data, hour, day, month_name, success, conflicts = await tasks_cog.update_sheet(force_schedule_update=True)
         
         status = "успешно" if success else "с ошибками"
@@ -80,8 +129,8 @@ class Admin(commands.Cog):
             msg += "---------------------------------\n"
             
             if absent:
-                guild = self.bot.get_guild(self.GUILD_ID)
-                mentions = [get_mention(name, guild) for name in absent]
+                # Используем self.get_mention
+                mentions = [self.get_mention(name) for name in absent]
                 msg += f"🚨 **ПРОГУЛЬЩИКИ:** {', '.join(mentions)}"
             else:
                 msg += "✨ **Все на месте!**"
@@ -101,8 +150,7 @@ class Admin(commands.Cog):
                 None, get_scheduled_workers, client, self.SPREADSHEET_ID_SCHEDULE, now, now.hour
             )
             if workers:
-                guild = self.bot.get_guild(self.GUILD_ID)
-                lines = [f"👤 {w} -> {get_mention(w, guild)}" for w in workers]
+                lines = [f"👤 {w} -> {self.get_mention(w)}" for w in workers]
                 await ctx.send(f"✅ **В графике ({len(workers)}):**\n" + "\n".join(lines))
             else:
                 await ctx.send("🕸️ В графике никого нет.")
@@ -120,8 +168,7 @@ class Admin(commands.Cog):
                 None, get_senior_for_hour, client, self.SPREADSHEET_ID_SCHEDULE, now, now.hour
             )
             if senior:
-                guild = self.bot.get_guild(self.GUILD_ID)
-                await ctx.send(f"👑 **Старший:** {senior} ({get_mention(senior, guild)})")
+                await ctx.send(f"👑 **Старший:** {senior} ({self.get_mention(senior)})")
             else:
                 await ctx.send("🤷‍♂️ Старший не найден.")
         except Exception as e:
@@ -131,8 +178,6 @@ class Admin(commands.Cog):
     @commands.has_any_role("Старший куратор", "Admin", "Administrator")
     async def очистить(self, ctx, days: int = 90):
         try:
-            # Для доступа к db_manager нужен доступ к коллектору или напрямую
-            # В bot.py мы привязали collector к боту
             deleted = self.bot.collector.db_manager.delete_old_records(days)
             await ctx.send(f"🗑️ Удалено {deleted} записей старше {days} дней.")
         except Exception as e:
