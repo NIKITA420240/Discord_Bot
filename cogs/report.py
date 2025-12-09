@@ -3,38 +3,52 @@ from discord.ext import commands, tasks
 import os
 import logging
 import sqlite3
+import requests
 from datetime import datetime, timedelta, time, timezone
+
+# Библиотеки для PDF
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-
-# Регистрируем шрифт (нужен файл шрифта, но reportlab по умолчанию не поддерживает кириллицу стандартными шрифтами)
-# Для простоты будем использовать встроенный шрифт, но кириллица может отображаться квадратиками без настройки.
-# ЛУЧШЕЕ РЕШЕНИЕ: Скачать файл шрифта (например Arial.ttf) и положить в папку.
-# Но пока сделаем транслит имен или попробуем без шрифта, если у вас его нет.
-# В Docker контейнере обычно нет шрифтов.
-# Я добавлю код, который попытается найти шрифт, или использует стандартный.
 
 class WeeklyReport(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.log_channel_id = int(os.getenv("LOG_CHANNEL_ID", 0))
         self.db_path = "bot_database.db"
+        self.font_path = "Arial.ttf"
+        
+        # Скачиваем шрифт, если его нет (для поддержки кириллицы)
+        self.download_font_if_needed()
+        
+        # Запускаем задачу
         self.report_task.start()
+
+    def download_font_if_needed(self):
+        if not os.path.exists(self.font_path):
+            logging.info("📥 Скачиваю шрифт Arial для PDF...")
+            try:
+                # Ссылка на свободный шрифт (LiberationSans похож на Arial)
+                url = "https://github.com/liberationfonts/liberation-fonts/raw/main/liberation-fonts-ttf/LiberationSans-Regular.ttf"
+                response = requests.get(url)
+                with open(self.font_path, 'wb') as f:
+                    f.write(response.content)
+                logging.info("✅ Шрифт скачан.")
+            except Exception as e:
+                logging.error(f"❌ Не удалось скачать шрифт: {e}")
 
     def cog_unload(self):
         self.report_task.cancel()
 
-    # Запуск каждое воскресенье в 23:00 (МСК = UTC+3, значит 20:00 UTC)
-    # 0 = Понедельник, 6 = Воскресенье
-    @tasks.loop(time=time(hour=20, minute=0)) 
+    # Запуск каждое воскресенье в 23:00 МСК
+    @tasks.loop(time=time(hour=20, minute=0)) # 20:00 UTC = 23:00 МСК
     async def report_task(self):
-        # Проверяем, что сегодня воскресенье
+        # Проверка на воскресенье (0=Пн, 6=Вс)
         now = datetime.now(timezone.utc) + timedelta(hours=3)
-        if now.weekday() == 6: 
+        if now.weekday() == 6:
             await self.generate_and_send_pdf()
 
     async def generate_and_send_pdf(self):
@@ -45,35 +59,31 @@ class WeeklyReport(commands.Cog):
         if not channel:
             return
 
-        filename = f"Weekly_Report_{datetime.now().strftime('%Y-%m-%d')}.pdf"
-        
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        filename = f"Otchet_{date_str}.pdf"
+
         try:
-            # 1. Получаем данные за неделю
-            stats = self.get_weekly_stats()
+            data = self.get_weekly_stats()
+            # Генерируем PDF (в отдельном потоке, чтобы не блочить бота)
+            await self.bot.loop.run_in_executor(None, self.create_pdf, filename, data)
             
-            # 2. Генерируем PDF
-            self.create_pdf(filename, stats)
-            
-            # 3. Отправляем
             file = discord.File(filename)
             await channel.send(
-                "📊 **Еженедельный отчет готов!**\nСодержит статистику по всем кураторам за последние 7 дней.", 
+                f"📊 **Еженедельный отчет ({date_str})**\nСтатистика работы кураторов.", 
                 file=file
             )
-            logging.info(f"PDF отчет {filename} отправлен.")
-            
+            logging.info(f"PDF отчет отправлен: {filename}")
         except Exception as e:
-            logging.error(f"Ошибка создания PDF: {e}")
+            logging.error(f"Ошибка генерации PDF: {e}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)
 
     def get_weekly_stats(self):
-        """Запрос к БД: группировка по кураторам за 7 дней"""
+        """Данные за последние 7 дней"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                # Берем последние 7 дней
                 cursor.execute('''
                     SELECT curator_name, SUM(chats_count), COUNT(*)
                     FROM curator_messages 
@@ -88,69 +98,63 @@ class WeeklyReport(commands.Cog):
             return []
 
     def create_pdf(self, filename, data):
+        # Регистрация шрифта
+        if os.path.exists(self.font_path):
+            pdfmetrics.registerFont(TTFont('Arial', self.font_path))
+            font_name = 'Arial'
+        else:
+            font_name = 'Helvetica' # Кириллица не будет работать
+
         doc = SimpleDocTemplate(filename, pagesize=A4)
         elements = []
+        
+        # Стили
         styles = getSampleStyleSheet()
+        style_title = ParagraphStyle('MyTitle', parent=styles['Heading1'], fontName=font_name, alignment=1)
+        style_body = ParagraphStyle('MyBody', parent=styles['Normal'], fontName=font_name)
 
         # Заголовок
-        title = Paragraph(f"Otchet za nedelyu (Weekly Report) - {datetime.now().strftime('%d.%m.%Y')}", styles['Title'])
-        elements.append(title)
-        elements.append(Spacer(1, 12))
+        elements.append(Paragraph(f"Отчет за неделю", style_title))
+        elements.append(Paragraph(f"Сформирован: {datetime.now().strftime('%d.%m.%Y')}", style_body))
+        elements.append(Spacer(1, 20))
 
         # Таблица
-        # Заголовки: Имя, Чаты, Часы
-        table_data = [['Name', 'Total Chats', 'Hours Worked']]
+        headers = ['Имя куратора', 'Всего чатов', 'Часов']
+        table_data = [headers]
         
-        total_chats_week = 0
-        total_hours_week = 0
+        total_chats = 0
+        total_hours = 0
 
         for row in data:
-            # row = (Name, Chats, Hours)
-            # Транслитерация нужна, если нет кириллического шрифта
-            # Но попробуем вывести как есть, если вдруг кракозябры - заменим на транслит
-            name = row[0] 
-            chats = row[1]
-            hours = row[2]
-            
-            total_chats_week += chats
-            total_hours_week += hours
-            
+            name, chats, hours = row
+            total_chats += chats
+            total_hours += hours
             table_data.append([str(name), str(chats), str(hours)])
 
-        # Итоговая строка
-        table_data.append(['TOTAL', str(total_chats_week), str(total_hours_week)])
+        # Итого
+        table_data.append(['ИТОГО:', str(total_chats), str(total_hours)])
 
         t = Table(table_data)
         t.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('FONTNAME', (0, 0), (-1, -1), font_name),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.navy),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -2), colors.beige), # Цвета строк
             ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('BACKGROUND', (0, -1), (-1, -1), colors.lightgrey), # Итоговая строка
-            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.lightgrey),
+            ('FONTNAME', (0, -1), (-1, -1), font_name),
         ]))
         
         elements.append(t)
         doc.build(elements)
 
-    # Команда для ручного теста
     @commands.command(name="отчет")
     @commands.has_any_role("Старший куратор", "Admin", "Administrator")
     async def manual_report(self, ctx):
-        await ctx.send("⏳ Генерирую PDF отчет...")
-        filename = "Manual_Report.pdf"
-        try:
-            stats = self.get_weekly_stats()
-            self.create_pdf(filename, stats)
-            await ctx.send(file=discord.File(filename))
-        except Exception as e:
-            await ctx.send(f"Ошибка: {e}")
-        finally:
-            if os.path.exists(filename):
-                os.remove(filename)
+        """Ручная генерация отчета"""
+        await ctx.send("⏳ Генерирую PDF...")
+        await self.generate_and_send_pdf()
+        await ctx.send("✅ Готово.")
 
 async def setup(bot):
     await bot.add_cog(WeeklyReport(bot))
